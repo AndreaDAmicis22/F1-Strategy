@@ -1,0 +1,22 @@
+fix = true
+line-length = 125
+unsafe-fixes = true
+
+[format]
+skip-magic-trailing-comma = false
+docstring-code-format = true
+
+[lint]
+select = ["ALL"]
+ignore = ["D", "ANN", "S101", "PGH003", "ERA001", "G004", "TD003", "PLW0603"]
+unfixable = ["T201"] # dont remove prints, but highlight them
+
+extend-ignore = [
+    "FIX002", # highlight TODOs
+    "NPY002", # use numpy default_rng() syntax
+    "COM812", # missing-trailing-comma -> causes issues with formatter
+    "S608", # possible SQL injection (unprotected query)
+]
+
+[lint.pydocstyle]
+convention = "google"
