@@ -7,23 +7,25 @@ Output: tempo totale, confronto scenari, raccomandazione
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 # ── Costanti Monza ─────────────────────────────────────────────────────────────
-BASE_LAP_TIME = 83.5  # secondi - tempo base giro Monza
-SAFETY_CAR_DELTA = 25.0  # secondi persi per SC (giro SC ~40s vs 83s)
-SC_LAP_TIME = 108.0  # tempo giro sotto SC
-PIT_LANE_DEFAULT = 22.5  # secondi perdita pit lane
+BASE_LAP_TIME = 83.5          # secondi - tempo base giro Monza
+SAFETY_CAR_DELTA = 25.0       # secondi persi per SC (giro SC ~40s vs 83s)
+SC_LAP_TIME = 108.0           # tempo giro sotto SC
+PIT_LANE_DEFAULT = 22.5       # secondi perdita pit lane
 
 # Parametri degrado per compound (secondi/giro di aggiuntivi per ogni giro stint)
 COMPOUND_CONFIG = {
     "soft": {
-        "base_delta": -0.8,  # più veloce del medium
+        "base_delta": -0.8,          # più veloce del medium
         "degradation_per_lap": 0.12,  # degrado rapido
         "max_optimal_laps": 20,
-        "wet_performance": 1.8,  # molto peggio sul bagnato
+        "wet_performance": 1.8,       # molto peggio sul bagnato
     },
     "medium": {
         "base_delta": 0.0,
@@ -32,29 +34,29 @@ COMPOUND_CONFIG = {
         "wet_performance": 1.2,
     },
     "hard": {
-        "base_delta": 0.4,  # leggermente più lento del medium
+        "base_delta": 0.4,           # leggermente più lento del medium
         "degradation_per_lap": 0.04,
         "max_optimal_laps": 42,
         "wet_performance": 1.5,
     },
     "intermediate": {
-        "base_delta": 2.0,  # molto lento su asciutto
+        "base_delta": 2.0,           # molto lento su asciutto
         "degradation_per_lap": 0.03,
         "max_optimal_laps": 40,
-        "wet_performance": -1.5,  # MOLTO meglio su bagnato leggero
+        "wet_performance": -1.5,     # MOLTO meglio su bagnato leggero
     },
     "wet": {
-        "base_delta": 5.0,  # inutilizzabile su asciutto
+        "base_delta": 5.0,           # inutilizzabile su asciutto
         "degradation_per_lap": 0.02,
         "max_optimal_laps": 45,
-        "wet_performance": -3.0,  # ideale su bagnato intenso
+        "wet_performance": -3.0,     # ideale su bagnato intenso
     },
 }
 
 # Impatto meteo sul tempo giro (secondi aggiuntivi)
 WEATHER_IMPACT = {
     "dry": 0.0,
-    "light_rain": 3.5,  # pioggia leggera
+    "light_rain": 3.5,   # pioggia leggera
     "heavy_rain": 8.0,
 }
 
@@ -72,7 +74,7 @@ class LapResult:
     lap: int
     lap_time: float
     compound: str
-    stint_lap: int  # giro all'interno dello stint
+    stint_lap: int         # giro all'interno dello stint
     weather: str
     is_pit_lap: bool = False
     is_sc_lap: bool = False
@@ -95,7 +97,7 @@ def _get_weather_at_lap(lap: int, conditions: dict) -> str:
     weather = conditions.get("weather", {})
     rain_start = weather.get("rain_start_lap", 999)
     rain_intensity = weather.get("rain_intensity", "light")
-
+    
     if lap >= rain_start:
         if rain_intensity == "heavy":
             return "heavy_rain"
@@ -111,19 +113,19 @@ def _calc_lap_time(
 ) -> float:
     """
     Calcola tempo singolo giro con degrado e meteo.
-
+    
     Formula:
       lap_time = base + compound_delta + (degradation_per_lap * stint_lap) + weather_adj
     """
     cfg = COMPOUND_CONFIG.get(compound, COMPOUND_CONFIG["medium"])
-
+    
     # Delta compound
     compound_delta = cfg["base_delta"]
-
+    
     # Degrado progressivo (accelera dopo max_optimal_laps)
     opt_laps = cfg["max_optimal_laps"]
     deg_rate = cfg["degradation_per_lap"]
-
+    
     if stint_lap <= opt_laps:
         degradation = deg_rate * stint_lap
     else:
@@ -148,11 +150,11 @@ def _calc_lap_time(
 def simulate_strategy(strategy: list, conditions: dict) -> SimulationResult:
     """
     Simula una strategia completa giro per giro.
-
+    
     Args:
         strategy: lista di dict {"stint", "compound", "start_lap"}
         conditions: race_conditions.json
-
+    
     Returns:
         SimulationResult con tempo totale e dettagli
     """
@@ -167,15 +169,13 @@ def simulate_strategy(strategy: list, conditions: dict) -> SimulationResult:
     stints = []
     sorted_strat = sorted(strategy, key=lambda x: x["start_lap"])
     for i, s in enumerate(sorted_strat):
-        end_lap = sorted_strat[i + 1]["start_lap"] - 1 if i + 1 < len(sorted_strat) else total_laps
-        stints.append(
-            StintSpec(
-                stint=s["stint"],
-                compound=s["compound"].lower(),
-                start_lap=s["start_lap"],
-                end_lap=end_lap,
-            )
-        )
+        end_lap = sorted_strat[i+1]["start_lap"] - 1 if i+1 < len(sorted_strat) else total_laps
+        stints.append(StintSpec(
+            stint=s["stint"],
+            compound=s["compound"].lower(),
+            start_lap=s["start_lap"],
+            end_lap=end_lap,
+        ))
 
     # Validazione
     warnings = []
@@ -207,7 +207,7 @@ def simulate_strategy(strategy: list, conditions: dict) -> SimulationResult:
 
         # Giro Safety Car?
         is_sc = sc_active and sc_lap <= lap < sc_lap + sc_duration
-
+        
         if is_sc:
             lap_time = SC_LAP_TIME
             note = "SC"
@@ -223,25 +223,23 @@ def simulate_strategy(strategy: list, conditions: dict) -> SimulationResult:
             note = f"PIT +{pit_time_loss}s"
 
         total_time += lap_time
-        lap_results.append(
-            LapResult(
-                lap=lap,
-                lap_time=round(lap_time, 3),
-                compound=stint.compound,
-                stint_lap=stint_lap,
-                weather=weather,
-                is_pit_lap=is_pit,
-                is_sc_lap=is_sc,
-                notes=note,
-            )
-        )
+        lap_results.append(LapResult(
+            lap=lap,
+            lap_time=round(lap_time, 3),
+            compound=stint.compound,
+            stint_lap=stint_lap,
+            weather=weather,
+            is_pit_lap=is_pit,
+            is_sc_lap=is_sc,
+            notes=note,
+        ))
 
     # Breakdown
     time_by_compound = {}
     for lr in lap_results:
         c = lr.compound
         time_by_compound[c] = time_by_compound.get(c, 0) + lr.lap_time
-
+    
     breakdown = {
         "time_by_compound": {k: round(v, 2) for k, v in time_by_compound.items()},
         "total_pit_time": round(pit_stops * pit_time_loss, 2),
@@ -258,191 +256,163 @@ def simulate_strategy(strategy: list, conditions: dict) -> SimulationResult:
     )
 
 
-def generate_candidate_strategies(conditions: dict, historical_patterns: dict | None = None) -> list:
+def generate_candidate_strategies(conditions: dict, historical_patterns: dict = None) -> list:
     """
     Genera strategie candidate da confrontare.
     Considera condizioni meteo, SC, e pattern storici.
     """
     total_laps = conditions.get("total_laps", 53)
     rain_start = conditions.get("weather", {}).get("rain_start_lap", 999)
-    conditions.get("weather", {}).get("rain_intensity", "none")
+    rain_intensity = conditions.get("weather", {}).get("rain_intensity", "none")
     sc_lap = conditions.get("safety_car", {}).get("lap", -1) if conditions.get("safety_car", {}).get("active") else -1
-
+    
     candidates = []
 
     # ── STRATEGIE DRY ────────────────────────────────────────────────────────
     # 1-stop classico Monza: Medium → Hard
-    candidates.append(
-        {
-            "name": "1-stop M→H (classico)",
-            "strategy": [
-                {"stint": 1, "compound": "medium", "start_lap": 1},
-                {"stint": 2, "compound": "hard", "start_lap": 27},
-            ],
-        }
-    )
+    candidates.append({
+        "name": "1-stop M→H (classico)",
+        "strategy": [
+            {"stint": 1, "compound": "medium", "start_lap": 1},
+            {"stint": 2, "compound": "hard", "start_lap": 27},
+        ]
+    })
 
     # 1-stop aggresivo: Soft → Hard
-    candidates.append(
-        {
-            "name": "1-stop S→H (aggressivo)",
-            "strategy": [
-                {"stint": 1, "compound": "soft", "start_lap": 1},
-                {"stint": 2, "compound": "hard", "start_lap": 18},
-            ],
-        }
-    )
-
+    candidates.append({
+        "name": "1-stop S→H (aggressivo)",
+        "strategy": [
+            {"stint": 1, "compound": "soft", "start_lap": 1},
+            {"stint": 2, "compound": "hard", "start_lap": 18},
+        ]
+    })
+    
     # 1-stop Hard → Medium
-    candidates.append(
-        {
-            "name": "1-stop H→M (conservativo)",
-            "strategy": [
-                {"stint": 1, "compound": "hard", "start_lap": 1},
-                {"stint": 2, "compound": "medium", "start_lap": 30},
-            ],
-        }
-    )
+    candidates.append({
+        "name": "1-stop H→M (conservativo)",
+        "strategy": [
+            {"stint": 1, "compound": "hard", "start_lap": 1},
+            {"stint": 2, "compound": "medium", "start_lap": 30},
+        ]
+    })
 
     # 2-stop S→M→H
-    candidates.append(
-        {
-            "name": "2-stop S→M→H",
-            "strategy": [
-                {"stint": 1, "compound": "soft", "start_lap": 1},
-                {"stint": 2, "compound": "medium", "start_lap": 15},
-                {"stint": 3, "compound": "hard", "start_lap": 33},
-            ],
-        }
-    )
+    candidates.append({
+        "name": "2-stop S→M→H",
+        "strategy": [
+            {"stint": 1, "compound": "soft", "start_lap": 1},
+            {"stint": 2, "compound": "medium", "start_lap": 15},
+            {"stint": 3, "compound": "hard", "start_lap": 33},
+        ]
+    })
 
     # 2-stop M→H→M undercut
-    candidates.append(
-        {
-            "name": "2-stop M→H→M (undercut SC)",
-            "strategy": [
-                {"stint": 1, "compound": "medium", "start_lap": 1},
-                {"stint": 2, "compound": "hard", "start_lap": 15},  # pit durante SC
-                {"stint": 3, "compound": "medium", "start_lap": 35},
-            ],
-        }
-    )
+    candidates.append({
+        "name": "2-stop M→H→M (undercut SC)",
+        "strategy": [
+            {"stint": 1, "compound": "medium", "start_lap": 1},
+            {"stint": 2, "compound": "hard", "start_lap": 15},  # pit durante SC
+            {"stint": 3, "compound": "medium", "start_lap": 35},
+        ]
+    })
 
     # ── STRATEGIE CON PIOGGIA (condizioni variabili) ─────────────────────────
     if rain_start and rain_start < total_laps:
+        
         # pit prima della pioggia o al SC
         pit1 = max(15, rain_start - 3)
         if sc_lap > 0:
             pit1 = sc_lap  # Sfrutta SC per pit (gratis!)
-
+        
         # 2-stop con intermediate per pioggia (OBBLIGATORIO con pioggia reale)
-        candidates.append(
-            {
-                "name": "Meteo: M→Inter@pioggia (2 stint)",
-                "strategy": [
-                    {"stint": 1, "compound": "medium", "start_lap": 1},
-                    {"stint": 2, "compound": "intermediate", "start_lap": rain_start},
-                ],
-            }
-        )
-
+        candidates.append({
+            "name": "Meteo: M→Inter@pioggia (2 stint)",
+            "strategy": [
+                {"stint": 1, "compound": "medium", "start_lap": 1},
+                {"stint": 2, "compound": "intermediate", "start_lap": rain_start},
+            ]
+        })
+        
         # 3-stop S→H→Inter: partenza aggressiva, hard nel mezzo, inter per pioggia
-        candidates.append(
-            {
-                "name": "Meteo OTTIMALE: S→H@SC→Inter@pioggia",
-                "strategy": [
-                    {"stint": 1, "compound": "soft", "start_lap": 1},
-                    {"stint": 2, "compound": "hard", "start_lap": pit1},
-                    {"stint": 3, "compound": "intermediate", "start_lap": rain_start},
-                ],
-            }
-        )
+        candidates.append({
+            "name": "Meteo OTTIMALE: S→H@SC→Inter@pioggia",
+            "strategy": [
+                {"stint": 1, "compound": "soft", "start_lap": 1},
+                {"stint": 2, "compound": "hard", "start_lap": pit1},
+                {"stint": 3, "compound": "intermediate", "start_lap": rain_start},
+            ]
+        })
 
         # Pit al SC + inter per pioggia (la più intelligente con SC+pioggia)
         if sc_lap > 0 and sc_lap < rain_start:
-            candidates.append(
-                {
-                    "name": "Meteo SMART: M→H@SC→Inter@pioggia",
-                    "strategy": [
-                        {"stint": 1, "compound": "medium", "start_lap": 1},
-                        {"stint": 2, "compound": "hard", "start_lap": sc_lap},
-                        {"stint": 3, "compound": "intermediate", "start_lap": rain_start},
-                    ],
-                }
-            )
+            candidates.append({
+                "name": "Meteo SMART: M→H@SC→Inter@pioggia",
+                "strategy": [
+                    {"stint": 1, "compound": "medium", "start_lap": 1},
+                    {"stint": 2, "compound": "hard", "start_lap": sc_lap},
+                    {"stint": 3, "compound": "intermediate", "start_lap": rain_start},
+                ]
+            })
             # Variante: soft start per più grip iniziale
-            candidates.append(
-                {
-                    "name": "Meteo SMART+: S→M@SC→Inter@pioggia",
-                    "strategy": [
-                        {"stint": 1, "compound": "soft", "start_lap": 1},
-                        {"stint": 2, "compound": "medium", "start_lap": sc_lap},
-                        {"stint": 3, "compound": "intermediate", "start_lap": rain_start},
-                    ],
-                }
-            )
+            candidates.append({
+                "name": "Meteo SMART+: S→M@SC→Inter@pioggia",
+                "strategy": [
+                    {"stint": 1, "compound": "soft", "start_lap": 1},
+                    {"stint": 2, "compound": "medium", "start_lap": sc_lap},
+                    {"stint": 3, "compound": "intermediate", "start_lap": rain_start},
+                ]
+            })
 
         # Scommessa: rimani su dry e sperare che asciughi (pioggia leggera)
         if conditions.get("weather", {}).get("rain_intensity") == "light":
-            candidates.append(
-                {
-                    "name": "Scommessa: M→H ignora pioggia leggera",
-                    "strategy": [
-                        {"stint": 1, "compound": "medium", "start_lap": 1},
-                        {"stint": 2, "compound": "hard", "start_lap": 28},
-                    ],
-                }
-            )
+            candidates.append({
+                "name": "Scommessa: M→H ignora pioggia leggera",
+                "strategy": [
+                    {"stint": 1, "compound": "medium", "start_lap": 1},
+                    {"stint": 2, "compound": "hard", "start_lap": 28},
+                ]
+            })
 
     return candidates
 
 
-def find_optimal_strategy(conditions: dict, historical_patterns: dict | None = None) -> dict:
+def find_optimal_strategy(conditions: dict, historical_patterns: dict = None) -> dict:
     """
     Confronta tutte le strategie candidate e restituisce la migliore.
     """
     candidates = generate_candidate_strategies(conditions, historical_patterns)
-
+    
     results = []
     for candidate in candidates:
         sim = simulate_strategy(candidate["strategy"], conditions)
-        results.append(
-            {
-                "name": candidate["name"],
-                "strategy": candidate["strategy"],
-                "total_time": sim.total_time,
-                "pit_stops": sim.pit_stops,
-                "warnings": sim.warnings,
-                "breakdown": sim.breakdown,
-                "lap_results": sim.lap_results,
-            }
-        )
+        results.append({
+            "name": candidate["name"],
+            "strategy": candidate["strategy"],
+            "total_time": sim.total_time,
+            "pit_stops": sim.pit_stops,
+            "warnings": sim.warnings,
+            "breakdown": sim.breakdown,
+            "lap_results": sim.lap_results,
+        })
         logger.info(f"  {candidate['name']}: {sim.total_time:.2f}s ({sim.pit_stops} stop)")
 
     # Ordina per tempo totale
     results.sort(key=lambda x: x["total_time"])
-
+    
     best = results[0]
     logger.info(f"Strategia ottimale: {best['name']} → {best['total_time']:.2f}s")
-
+    
     return {
         "optimal": best,
         "all_scenarios": results,
-        "ranking": [
-            {
-                "rank": i + 1,
-                "name": r["name"],
-                "total_time": r["total_time"],
-                "delta": round(r["total_time"] - results[0]["total_time"], 2),
-            }
-            for i, r in enumerate(results)
-        ],
+        "ranking": [{"rank": i+1, "name": r["name"], "total_time": r["total_time"], "delta": round(r["total_time"] - results[0]["total_time"], 2)} 
+                    for i, r in enumerate(results)],
     }
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-
+    
     conditions = {
         "circuit": "Monza",
         "total_laps": 53,
@@ -455,6 +425,6 @@ if __name__ == "__main__":
         "grid_position": 6,
         "pit_lane_time_loss_seconds": 22.5,
     }
-
+    
     result = find_optimal_strategy(conditions)
     print(json.dumps(result["ranking"], indent=2))
