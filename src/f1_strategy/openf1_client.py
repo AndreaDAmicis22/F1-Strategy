@@ -89,13 +89,18 @@ def fetch(endpoint: str, params: dict | None = None, use_cache: bool = True, max
                 all_results = data if isinstance(data, list) else [data]
             break
         except HTTPError as e:
-            logger.exception(f"HTTP {e.code} su {url}: {e.reason}")
-            if e.code in (429, 503):
-                wait_time = (attempt + 1) * 10
-                logger.warning(f"Rate limit colpito. Attesa {wait_time}s...")
+            if e.code == 429:
+                wait_time = 2 ** (attempt + 3)  # 8s, 16s, 32s invece di 10, 20, 30
+                logger.warning(f"Rate limit (429). Attesa {wait_time}s prima del retry {attempt + 1}/{max_retries}...")
                 time.sleep(wait_time)
                 attempt += 1
                 continue
+            if e.code == 503:
+                wait_time = 2**attempt
+                time.sleep(wait_time)
+                attempt += 1
+                continue
+            logger.exception(f"HTTP {e.code} su {url}: {e.reason}")
             break
         except URLError as e:
             logger.warning(f"URLError (tentativo {attempt + 1}): {e.reason}")

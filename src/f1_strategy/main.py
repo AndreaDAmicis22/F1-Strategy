@@ -25,10 +25,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "agents"))
 
+import argparse
+
 import agents.data_analysis_agent as data_agent
 import agents.race_simulator as simulator
 import agents.report_generator as reporter
 from agents import strategy_agent
+from agents.ml_predictor import ModelNotTrainedError, StrategyEvaluator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,8 +106,7 @@ def run_pipeline(conditions_path=None, skip_api=False, use_ml=True):
     conditions = load_conditions(conditions_path)
     circuit = conditions.get("circuit", "Monza")
     logger.info(
-        f"Circuito: {circuit} | Giri: {conditions.get('total_laps')} | "
-        f"Meteo: {conditions.get('weather', {}).get('type')}"
+        f"Circuito: {circuit} | Giri: {conditions.get('total_laps')} | Meteo: {conditions.get('weather', {}).get('type')}"
     )
 
     # STEP ML: Training modelli
@@ -114,14 +116,10 @@ def run_pipeline(conditions_path=None, skip_api=False, use_ml=True):
     if use_ml:
         logger.info("\n[ML] Caricamento modelli ML (addestrati su dati reali OpenF1)...")
         try:
-            from ml_predictor import StrategyEvaluator, ModelNotTrainedError
             ml_evaluator = StrategyEvaluator.load()
             ml_report = ml_evaluator.get_models_info()
             ltp_metrics = ml_report.get("lap_time_predictor", {}).get("metrics", {})
-            logger.info(
-                f"  LapTimePredictor (GBR): MAE={ltp_metrics.get('MAE','?')}s  "
-                f"R2={ltp_metrics.get('R2','?')}"
-            )
+            logger.info(f"  LapTimePredictor (GBR): MAE={ltp_metrics.get('MAE', '?')}s  R2={ltp_metrics.get('R2', '?')}")
             ml_recommendation = ml_evaluator.recommend_strategy(conditions)
             logger.info("  Raccomandazione ML compound (da dati reali):")
             for s in ml_recommendation.get("ml_recommended_stints", []):
@@ -159,16 +157,12 @@ def run_pipeline(conditions_path=None, skip_api=False, use_ml=True):
         simulation_result["optimal"]["total_time_ml"] = ml_eval["total_time"]
         simulation_result["optimal"]["ml_breakdown"] = ml_eval["breakdown"]
         logger.info(
-            f"  Tempo fisico: {simulation_result['optimal']['total_time']:.2f}s | "
-            f"Tempo ML: {ml_eval['total_time']:.2f}s"
+            f"  Tempo fisico: {simulation_result['optimal']['total_time']:.2f}s | Tempo ML: {ml_eval['total_time']:.2f}s"
         )
 
     ranking = simulation_result.get("ranking", [])
     logger.info(f"  Scenari simulati: {len(ranking)}")
-    logger.info(
-        f"  Migliore: {simulation_result['optimal']['name']} -> "
-        f"{simulation_result['optimal']['total_time']:.2f}s"
-    )
+    logger.info(f"  Migliore: {simulation_result['optimal']['name']} -> {simulation_result['optimal']['total_time']:.2f}s")
 
     # STEP 3: Strategia finale
     logger.info("\n[3/4] Generazione strategia ottimale...")
@@ -203,7 +197,7 @@ def run_pipeline(conditions_path=None, skip_api=False, use_ml=True):
     elapsed = time.time() - start_time
     logger.info(f"\n{'=' * 60}")
     logger.info(f"  Pipeline completata in {elapsed:.1f}s")
-    logger.info(f"  Output salvati in: outputs/")
+    logger.info("  Output salvati in: outputs/")
     logger.info(f"{'=' * 60}")
 
     print("\n" + "=" * 60)
@@ -229,8 +223,6 @@ def run_pipeline(conditions_path=None, skip_api=False, use_ml=True):
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="F1 Strategy System - Scuderia Algoritmo")
     parser.add_argument("--conditions", type=str, default=None)
     parser.add_argument("--no-api", action="store_true")
