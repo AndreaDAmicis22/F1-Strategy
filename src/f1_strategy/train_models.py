@@ -102,7 +102,7 @@ def load_and_clean(csv_path: Path) -> pd.DataFrame:
     return df
 
 
-def _temporal_split(df: pd.DataFrame, test_circuit: str | None = None):
+def _temporal_split(df: pd.DataFrame, test_circuit: str | None = None, test_ratio: float = 0.15):
     """
     Divide train/test in modo temporalmente corretto.
 
@@ -110,8 +110,8 @@ def _temporal_split(df: pd.DataFrame, test_circuit: str | None = None):
         train = tutte le gare tranne Monza
         test  = solo Monza
     Altrimenti:
-        train = sessioni più vecchie (80%)
-        test  = sessioni più recenti (20%)
+        train = sessioni più vecchie
+        test  = sessioni più recenti
 
     In entrambi i casi non c'è mai data leakage: il test
     contiene solo gare che il modello non ha mai visto.
@@ -127,13 +127,12 @@ def _temporal_split(df: pd.DataFrame, test_circuit: str | None = None):
 
     # Split temporale: ordina sessioni per session_key (proxy dell'ordine cronologico)
     sessions = sorted(df["session_key"].unique())
-    n_test = max(1, len(sessions) // 5)
+    n_test = max(1, int(len(sessions) * test_ratio))
     test_sess = sessions[-n_test:]
     train_sess = sessions[:-n_test]
-
     train_df = df[df["session_key"].isin(train_sess)]
     test_df = df[df["session_key"].isin(test_sess)]
-    logger.info(f"  Split temporale: train={len(train_sess)} sessioni, test={len(test_sess)} sessioni")
+    logger.info(f"  Split temporale ({test_ratio:.0%}): train={len(train_sess)} sessioni, test={len(test_sess)} sessioni")
     return train_df, test_df
 
 
@@ -228,10 +227,11 @@ def train_lap_time_model(df: pd.DataFrame, test_circuit: str | None = None) -> d
 
 # ── Modello 2: DegradationModel ───────────────────────────────────────────────
 def train_degradation_model(df: pd.DataFrame, test_circuit: str | None = None) -> dict:
-    logger.info("\n=== Training DegradationModel (Enhanced Ridge polynomial) ===")
+    logger.info("\n=== Training DegradationModel (Enhanced Ridge) ===")
 
-    # Split train/test anche qui: valuta se il degrado appreso generalizza
     train_df, test_df = _temporal_split(df, test_circuit)
+
+    DEGR_FEATURES = ["stint_lap", "track_temp", "speed_mean", "lap_number"]
 
     results = {}
     models = {}
@@ -240,78 +240,44 @@ def train_degradation_model(df: pd.DataFrame, test_circuit: str | None = None) -
         sub_train = train_df[train_df["compound"] == compound]
         sub_test = test_df[test_df["compound"] == compound]
 
-        if len(sub_train) < 30:
-            logger.warning(f"  {compound}: troppo pochi dati in train ({len(sub_train)} giri), skip")
+        if len(sub_train) < 50:
             continue
 
-        # Solo giri dry per misurare degrado puro
-        sub_train_dry = sub_train[sub_train["weather_enc"] == 0]
-        sub_test_dry = sub_test[sub_test["weather_enc"] == 0]
-        if len(sub_train_dry) < 20:
-            sub_train_dry = sub_train
-            sub_test_dry = sub_test
+        # Target = delta rispetto al best pace (5° percentile) della sessione
+        y_train = sub_train["lap_duration_norm"].values.astype(np.float32)
+        X_train = sub_train[DEGR_FEATURES].values.astype(np.float32)
 
-        X_train = sub_train_dry[["stint_lap"]].values.astype(np.float32)
-        X_test = sub_test_dry[["stint_lap"]].values.astype(np.float32) if len(sub_test_dry) > 0 else None
+        X_test = sub_test[DEGR_FEATURES].values.astype(np.float32) if len(sub_test) > 0 else None
+        y_test = sub_test["lap_duration_norm"].values.astype(np.float32) if len(sub_test) > 0 else None
 
-        # Target = delta rispetto al giro fresco (stint_lap <= 2) del train set
-        baseline_mask = sub_train_dry["stint_lap"] <= 2
-        baseline = (
-            sub_train_dry.loc[baseline_mask, "lap_duration"].median()
-            if baseline_mask.any()
-            else sub_train_dry["lap_duration"].mean()
-        )
-        y_train = sub_train_dry["lap_duration"].values.astype(np.float32) - baseline
-
+        # Pipeline con StandardScaler (fondamentale ora che le features hanno scale diverse)
         pipe = Pipeline(
             [
-                ("poly", PolynomialFeatures(degree=2, include_bias=True)),
-                ("ridge", Ridge(alpha=1.0)),
+                ("scaler", StandardScaler()),
+                ("poly", PolynomialFeatures(degree=2, include_bias=False)),
+                ("ridge", Ridge(alpha=10.0)),
             ]
         )
+
         pipe.fit(X_train, y_train)
 
-        # Valutazione sul test set (se disponibile)
         test_mae = None
-        if X_test is not None and len(X_test) > 0:
-            y_test = sub_test_dry["lap_duration"].values.astype(np.float32) - baseline
+        if X_test is not None:
             preds = pipe.predict(X_test)
             test_mae = round(float(mean_absolute_error(y_test, preds)), 4)
 
-        # Stima cliff: giri prima di +2s di degrado
-        opt_lap = 1
-        for lap in range(1, 55):
-            delta_pred = pipe.predict(np.array([[lap]]))[0]
-            if delta_pred > 2.0:
-                break
-            opt_lap = lap
-
-        ridge = pipe.named_steps["ridge"]
-        coefs = {
-            "intercept": round(float(ridge.intercept_), 4),
-            "coef_linear": round(float(ridge.coef_[1]), 5),
-            "coef_quad": round(float(ridge.coef_[2]), 6),
-            "estimated_optimal_stint_laps": opt_lap,
-            "baseline_lap_time": round(float(baseline), 3),
-            "n_train": len(sub_train_dry),
-            "n_test": len(sub_test_dry) if sub_test_dry is not None else 0,
-            "test_mae": test_mae,
-        }
-        results[compound] = coefs
+        # Salvataggio
         models[compound] = pipe
+        results[compound] = {"n_train": len(sub_train), "test_mae": test_mae, "features": DEGR_FEATURES}
 
-        mae_str = f"  test_MAE={test_mae:.4f}s" if test_mae is not None else "  test_MAE=N/A"
-        logger.info(
-            f"  {compound:<14} deg/lap≈{coefs['coef_linear']:.4f}s  "
-            f"cliff≈{opt_lap}giri  n_train={len(sub_train_dry)}{mae_str}"
-        )
+        mae_str = f" test_MAE={test_mae:.4f}s" if test_mae else ""
+        logger.info(f"  {compound:<14} {len(sub_train)} giri {mae_str}")
 
     path = MODEL_DIR / "degradation_model.pkl"
     with open(path, "wb") as f:
-        pickle.dump({"models": models, "coefficients": results}, f)
-    logger.info(f"  Salvato: {path}")
+        pickle.dump({"models": models, "metadata": results}, f)
 
-    return {"type": "Ridge(polynomial, degree=2) per compound", "compounds": results}
+    return {"type": "Multi-feature Ridge Polynomial", "compounds": results}
 
 
 # ── Modello 3: CompoundRecommender ────────────────────────────────────────────

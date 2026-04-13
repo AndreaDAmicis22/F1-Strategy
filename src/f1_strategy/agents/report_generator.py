@@ -247,7 +247,7 @@ def save_outputs(
 ):
     """Salva tutti gli output nella cartella outputs/."""
     if output_dir is None:
-        BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
+        BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent.parent
         output_dir = BASE_DIR / "outputs"
 
     output_dir.mkdir(parents=True, exist_ok=True)

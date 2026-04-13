@@ -24,7 +24,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-MODEL_DIR = Path(__file__).parent.parent.parent / "models"
+BASE_DIR = Path(__file__).parent.parent.parent.parent
+MODEL_DIR = BASE_DIR / "models"
 
 COMPOUND_ENC = {"soft": 0, "medium": 1, "hard": 2, "intermediate": 3, "wet": 4}
 WEATHER_ENC = {"dry": 0, "light_rain": 1, "heavy_rain": 2}
@@ -34,12 +35,7 @@ class ModelNotTrainedError(RuntimeError):
     """Sollevato quando i modelli non sono stati ancora addestrati."""
 
     def __init__(self, model_name: str):
-        super().__init__(
-            f"\n[ML] Modello '{model_name}' non trovato in {MODEL_DIR}/\n"
-            f"Per addestrarlo:\n"
-            f"  1. python collect_training_data.py   # scarica dati reali OpenF1\n"
-            f"  2. python train_models.py             # addestra i modelli\n"
-        )
+        super().__init__(f"\n[ML] Modello '{model_name}' non trovato...")
 
 
 def _load_pickle(filename: str) -> dict:
@@ -71,47 +67,32 @@ class LapTimePredictor:
         track_temp: float = 38.0,
         air_temp: float = 25.0,
         lap_number: int = 1,
+        speed_range: float = 50.0,
+        speed_mean: float = 210.0,
+        sec1_norm: float = 0.0,
+        sec2_norm: float = 0.0,
+        sec3_norm: float = 0.0,
+        humidity: float = 50.0,
+        wind_speed: float = 5.0,
     ) -> float:
-        np.array(
-            [
-                [
-                    COMPOUND_ENC.get(compound.lower(), 1),
-                    stint_lap,
-                    stint_lap**2,
-                    WEATHER_ENC.get(weather, 0),
-                    air_temp,
-                    track_temp,
-                    lap_number,
-                ]
-            ],
-            dtype=np.float32,
-        )
-        # Riordina secondo l'ordine di feature del training
-        feature_order = {f: i for i, f in enumerate(self.features)}
-        [
-            feature_order.get("compound_enc", 0),
-            feature_order.get("stint_lap", 1),
-            feature_order.get("stint_lap_sq", 2),
-            feature_order.get("weather_enc", 3),
-            feature_order.get("air_temp", 4),
-            feature_order.get("track_temp", 5),
-            feature_order.get("lap_number", 6),
-        ]
-        # Costruisci X nell'ordine corretto
-        X_ordered = np.array(
-            [
-                [
-                    COMPOUND_ENC.get(compound.lower(), 1),
-                    stint_lap,
-                    stint_lap**2,
-                    WEATHER_ENC.get(weather, 0),
-                    air_temp,
-                    track_temp,
-                    lap_number,
-                ]
-            ],
-            dtype=np.float32,
-        )
+        input_data = {
+            "compound_enc": COMPOUND_ENC.get(compound.lower(), 1),
+            "stint_lap": stint_lap,
+            "stint_lap_sq": stint_lap**2,
+            "weather_enc": WEATHER_ENC.get(weather, 0),
+            "air_temp": air_temp,
+            "track_temp": track_temp,
+            "lap_number": lap_number,
+            "duration_sector_1_norm": sec1_norm,
+            "duration_sector_2_norm": sec2_norm,
+            "duration_sector_3_norm": sec3_norm,
+            "speed_mean": speed_mean,
+            "speed_range": speed_range,
+            "humidity": humidity,
+            "wind_speed": wind_speed,
+        }
+
+        X_ordered = np.array([[input_data[f] for f in self.features]], dtype=np.float32)
         return float(self.model.predict(X_ordered)[0])
 
     def evaluate(self, X_test=None, y_test=None) -> dict:
@@ -141,15 +122,17 @@ class DegradationModel:
     def __init__(self):
         payload = _load_pickle("degradation_model.pkl")
         self.models = payload["models"]
-        self.coefficients = payload["coefficients"]
+        self.coefficients = payload.get("metadata", payload.get("coefficients", {}))
         logger.info(f"DegradationModel caricato per: {list(self.models.keys())} ✓")
 
-    def predict_degradation(self, compound: str, stint_lap: int) -> float:
+    def predict_degradation(
+        self, compound: str, stint_lap: int, track_temp: float = 38.0, speed_mean: float = 210.0, lap_number: int = 1
+    ) -> float:
         compound = compound.lower()
         if compound not in self.models:
             logger.warning(f"Compound '{compound}' non nel modello, uso 0")
             return 0.0
-        X = np.array([[stint_lap]])
+        X = np.array([[stint_lap, track_temp, speed_mean, lap_number]], dtype=np.float32)
         delta = float(self.models[compound].predict(X)[0])
         return max(0.0, delta)
 
@@ -185,30 +168,26 @@ class CompoundRecommender:
         stint_position: int = 1,
         track_temp: float = 38.0,
         air_temp: float = 25.0,
+        lap_start: int = 1,
+        speed_avg: float = 210.0,
+        sec1_deg: float = 0.0,
+        sec2_deg: float = 0.0,
+        sec3_deg: float = 0.0,
     ) -> dict:
         weather_enc = WEATHER_ENC.get(weather, 0)
-        X = np.array(
-            [
-                [
-                    n_laps,
-                    weather_enc,
-                    air_temp,
-                    track_temp,
-                    n_laps**0.5,
-                ]
-            ],
+        X_base = np.array(
+            [[n_laps, weather_enc, air_temp, track_temp, lap_start, speed_avg, sec1_deg, sec2_deg, sec3_deg]],
             dtype=np.float32,
         )
 
-        pred_enc = int(self.model.predict(X)[0])
-        proba = self.model.predict_proba(X)[0]
-        classes = self.model.classes_
+        sqrt_n_laps = np.sqrt(X_base[:, 0:1])
+        X_final = np.hstack([X_base, sqrt_n_laps])
+
+        pred_enc = self.model.predict(X_final)[0]
+        proba = self.model.predict_proba(X_final)[0]
         compound = self.label_encoder.inverse_transform([pred_enc])[0]
 
-        proba_dict = {}
-        for cls, p in zip(classes, proba, strict=False):
-            name = self.label_encoder.inverse_transform([int(cls)])[0]
-            proba_dict[name] = round(float(p), 3)
+        proba_dict = {self.label_encoder.inverse_transform([i])[0]: round(float(p), 3) for i, p in enumerate(proba)}
 
         return {
             "best_compound": compound,
