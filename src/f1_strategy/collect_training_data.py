@@ -14,6 +14,7 @@ Output:
     data/sessions_meta.json — metadata sessioni scaricate
 """
 
+import argparse
 import csv
 import json
 import logging
@@ -36,8 +37,6 @@ SESSION_TYPE = "Race"
 
 
 # ── Trova sessioni ─────────────────────────────────────────────────────────────
-
-
 def get_all_race_sessions(years=YEARS):
     """Scarica tutte le sessioni Race degli anni specificati."""
     sessions = []
@@ -51,8 +50,6 @@ def get_all_race_sessions(years=YEARS):
 
 
 # ── Scarica laps con compound ──────────────────────────────────────────────────
-
-
 def get_laps_with_compound(session_key: int) -> list[dict]:
     """
     Unisce laps + stints per ottenere il compound su ogni giro.
@@ -137,8 +134,6 @@ def get_race_control_events(session_key: int) -> list[dict]:
 
 
 # ── Merge meteo su ogni giro ───────────────────────────────────────────────────
-
-
 def merge_weather_to_laps(laps: list[dict], weather_data: list[dict], sc_laps: set) -> list[dict]:
     """
     Associa a ogni giro le condizioni meteo più vicine temporalmente.
@@ -175,8 +170,6 @@ def merge_weather_to_laps(laps: list[dict], weather_data: list[dict], sc_laps: s
 
 
 # ── Calcola stint_lap ──────────────────────────────────────────────────────────
-
-
 def add_stint_lap(laps: list[dict]) -> list[dict]:
     """
     Aggiunge stint_lap = giro relativo all'interno dello stint per ogni giro.
@@ -205,7 +198,6 @@ def add_stint_lap(laps: list[dict]) -> list[dict]:
 
 
 # ── Salva CSV ──────────────────────────────────────────────────────────────────
-
 LAP_FIELDS = [
     "session_key",
     "driver_number",
@@ -244,8 +236,6 @@ def save_sessions_meta(sessions: list[dict], path: Path):
 
 
 # ── Pipeline principale ────────────────────────────────────────────────────────
-
-
 def run(years=YEARS, circuit_filter: str | None = None):
     """
     Scarica dati per tutte le gare (o solo un circuito se specificato).
@@ -334,8 +324,6 @@ def run(years=YEARS, circuit_filter: str | None = None):
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Scarica dati reali OpenF1 per training ML")
     parser.add_argument("--years", nargs="+", type=int, default=[2023, 2024, 2025])
     parser.add_argument(
