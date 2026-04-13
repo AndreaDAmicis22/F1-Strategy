@@ -90,7 +90,7 @@ def fetch(endpoint: str, params: dict | None = None, use_cache: bool = True, max
             break
         except HTTPError as e:
             if e.code == 429:
-                wait_time = 2 ** (attempt + 3)  # 8s, 16s, 32s invece di 10, 20, 30
+                wait_time = 2 ** (attempt + 3)
                 logger.warning(f"Rate limit (429). Attesa {wait_time}s prima del retry {attempt + 1}/{max_retries}...")
                 time.sleep(wait_time)
                 attempt += 1
@@ -117,8 +117,6 @@ def fetch(endpoint: str, params: dict | None = None, use_cache: bool = True, max
 
 
 # ── Helpers specifici per entità ──────────────────────────────────────────────
-
-
 def get_sessions(circuit_key: str | None = None, year: int | None = None, session_type: str = "Race") -> list:
     params = {"session_type": session_type}
     if circuit_key:

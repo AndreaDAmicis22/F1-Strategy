@@ -4,15 +4,8 @@ train_models.py
 Addestra i modelli ML sui dati REALI scaricati da OpenF1 (via collect_training_data.py).
 
 Uso:
-    # Prima scarica i dati reali:
-    python collect_training_data.py --years 2023 2024
-
-    # Poi addestra i modelli:
-    python train_models.py
-
-    # Solo su Monza:
-    python collect_training_data.py --circuit Monza
-    python train_models.py --data ../../data/laps_raw.csv
+    python src/f1_strategy/train_models.py --data data/all_circuits_laps.csv
+    python src/f1_strategy/train_models.py --data data/all_circuits_laps.csv --test-circuit Monza
 
 Output:
     models/lap_time_model.pkl        — GradientBoostingRegressor tempi giro
@@ -21,6 +14,7 @@ Output:
     models/training_report.json      — metriche, feature importance, distribuzione dati
 """
 
+import argparse
 import json
 import logging
 import math
@@ -32,64 +26,118 @@ import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.model_selection import cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, PolynomialFeatures, StandardScaler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("trainer")
 
-DATA_DIR   = Path(__file__).parent.parent.parent / "data"
-MODEL_DIR  = Path(__file__).parent.parent.parent / "models"
+DATA_DIR = Path(__file__).parent.parent.parent / "data"
+MODEL_DIR = Path(__file__).parent.parent.parent / "models"
 MODEL_DIR.mkdir(exist_ok=True)
 
 COMPOUND_ENC = {"soft": 0, "medium": 1, "hard": 2, "intermediate": 3, "wet": 4}
 
-# Filtra giri anomali (SC, pit out, outlier)
-LAP_TIME_MIN = 60.0   # secondi — nessun circuito F1 sotto 60s
-LAP_TIME_MAX = 200.0  # secondi — oltre questo = SC o problema
+LAP_TIME_MIN = 60.0
+LAP_TIME_MAX = 200.0
 
 
 # ── Carica e pulisce il dataset ────────────────────────────────────────────────
-
 def load_and_clean(csv_path: Path) -> pd.DataFrame:
     logger.info(f"Caricamento dati: {csv_path}")
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, encoding="utf-8", encoding_errors="replace")
     logger.info(f"  Righe raw: {len(df)}")
 
-    # Rimuovi giri invalidi
     df = df[df["lap_duration"].between(LAP_TIME_MIN, LAP_TIME_MAX)]
     df = df[df["compound"].isin(COMPOUND_ENC.keys())]
-    df = df[df["is_pit_out_lap"] != True]    # noqa: E712
-    df = df[df["is_sc_lap"] != True]          # giri SC falsano il tempo
+    df = df[df["is_pit_out_lap"] != True]  # noqa: E712
+    df = df[df["is_sc_lap"] != True]  # noqa: E712
 
-    # Encode compound
     df["compound_enc"] = df["compound"].map(COMPOUND_ENC)
 
-    # Meteo: pioggia → categoria
     df["rainfall"] = df["rainfall"].fillna(0.0)
-    df["weather_enc"] = df["rainfall"].apply(
-        lambda r: 2 if r > 2.0 else (1 if r > 0.1 else 0)
-    )
+    df["weather_enc"] = df["rainfall"].apply(lambda r: 2 if r > 2.0 else (1 if r > 0.1 else 0))
 
-    # Imputa temperature mancanti con mediana per circuito/sessione
-    df["air_temp"]   = df.groupby("session_key")["air_temp"].transform(lambda x: x.fillna(x.median()))
+    df["air_temp"] = df.groupby("session_key")["air_temp"].transform(lambda x: x.fillna(x.median()))
     df["track_temp"] = df.groupby("session_key")["track_temp"].transform(lambda x: x.fillna(x.median()))
-    df["air_temp"]   = df["air_temp"].fillna(25.0)
+    df["air_temp"] = df["air_temp"].fillna(25.0)
     df["track_temp"] = df["track_temp"].fillna(38.0)
 
-    # stint_lap al quadrato per degrado non lineare
     df["stint_lap_sq"] = df["stint_lap"] ** 2
 
+    # Normalizza il tempo giro rispetto al best pace della sessione.
+    # Rimuove l'effetto "circuito diverso" (Monaco 75s vs Monza 83s vs Spa 107s) e lascia solo il segnale di degrado relativo.
+    df["lap_duration_norm"] = df.groupby("session_key")["lap_duration"].transform(lambda x: x - x.quantile(0.05))
+
+    # Velocità medie: proxy diretto del grip disponibile
+    df["speed_mean"] = df[["i1_speed", "i2_speed", "st_speed"]].mean(axis=1)
+    # Differenza velocità tra tratti: indica bilanciamento aerodinamico/gomme
+    df["speed_range"] = df["st_speed"] - df[["i1_speed", "i2_speed"]].min(axis=1)
+
+    # Settori normalizzati per sessione (stesso motivo di lap_duration_norm)
+    for sec in ["duration_sector_1", "duration_sector_2", "duration_sector_3"]:
+        df[f"{sec}_norm"] = df.groupby("session_key")[sec].transform(lambda x: x - x.quantile(0.05))
+
+    # Imputa NaN nelle colonne nuove
+    speed_cols = ["i1_speed", "i2_speed", "st_speed", "speed_mean", "speed_range"]
+    sector_cols = ["duration_sector_1_norm", "duration_sector_2_norm", "duration_sector_3_norm"]
+    for col in speed_cols + sector_cols:
+        df[col] = df.groupby(["session_key", "compound"])[col].transform(lambda x: x.fillna(x.median()))
+        df[col] = df[col].fillna(df[col].median())
+
+    for col in sector_cols + speed_cols:
+        null_pct = df[col].isna().mean()
+        if null_pct > 0.3:
+            logger.warning(f"  {col}: {null_pct:.0%} NaN dopo imputazione, esclusa dalle features")
+            LAP_FEATURES.remove(col) if col in LAP_FEATURES else None
+
+    df["humidity"] = df["humidity"].fillna(df["humidity"].median())
+    df["wind_speed"] = df["wind_speed"].fillna(0.0)
+
     logger.info(f"  Righe dopo pulizia: {len(df)}")
+    logger.info(f"  Sessioni: {df['session_key'].nunique()}")
     logger.info(f"  Circuiti: {df['location'].nunique() if 'location' in df.columns else 'N/A'}")
     logger.info(f"  Compound distribution:\n{df['compound'].value_counts().to_string()}")
-
     return df
 
 
-# ── Feature engineering ────────────────────────────────────────────────────────
+def _temporal_split(df: pd.DataFrame, test_circuit: str | None = None):
+    """
+    Divide train/test in modo temporalmente corretto.
 
+    Se test_circuit è specificato (es. "Monza"):
+        train = tutte le gare tranne Monza
+        test  = solo Monza
+    Altrimenti:
+        train = sessioni più vecchie (80%)
+        test  = sessioni più recenti (20%)
+
+    In entrambi i casi non c'è mai data leakage: il test
+    contiene solo gare che il modello non ha mai visto.
+    """
+    if test_circuit:
+        loc_col = "location" if "location" in df.columns else None
+        if loc_col and df[loc_col].str.lower().str.contains(test_circuit.lower()).any():
+            train_df = df[~df[loc_col].str.lower().str.contains(test_circuit.lower())]
+            test_df = df[df[loc_col].str.lower().str.contains(test_circuit.lower())]
+            logger.info(f"  Split per circuito: train=tutto tranne {test_circuit}, test={test_circuit}")
+            return train_df, test_df
+        logger.warning(f"  Circuito '{test_circuit}' non trovato, uso split temporale")
+
+    # Split temporale: ordina sessioni per session_key (proxy dell'ordine cronologico)
+    sessions = sorted(df["session_key"].unique())
+    n_test = max(1, len(sessions) // 5)
+    test_sess = sessions[-n_test:]
+    train_sess = sessions[:-n_test]
+
+    train_df = df[df["session_key"].isin(train_sess)]
+    test_df = df[df["session_key"].isin(test_sess)]
+    logger.info(f"  Split temporale: train={len(train_sess)} sessioni, test={len(test_sess)} sessioni")
+    return train_df, test_df
+
+
+# ── Feature engineering ────────────────────────────────────────────────────────
 LAP_FEATURES = [
     "compound_enc",
     "stint_lap",
@@ -98,7 +146,15 @@ LAP_FEATURES = [
     "air_temp",
     "track_temp",
     "lap_number",
+    "duration_sector_1_norm",  # degrado settore 1
+    "duration_sector_2_norm",  # degrado settore 2
+    "duration_sector_3_norm",  # degrado settore 3
+    "speed_mean",  # grip medio
+    "speed_range",  # bilanciamento aero/gomme
+    "humidity",  # condizioni aria
+    "wind_speed",  # vento (impatta downforce a Monza)
 ]
+
 
 def build_lap_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     X = df[LAP_FEATURES].values.astype(np.float32)
@@ -107,51 +163,55 @@ def build_lap_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ── Modello 1: LapTimePredictor ────────────────────────────────────────────────
-
-def train_lap_time_model(df: pd.DataFrame) -> dict:
+def train_lap_time_model(df: pd.DataFrame, test_circuit: str | None = None) -> dict:
     logger.info("\n=== Training LapTimePredictor (GradientBoosting) ===")
 
-    X, y = build_lap_features(df)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    train_df, test_df = _temporal_split(df, test_circuit)
+    logger.info(f"  Train: {len(train_df)} giri  |  Test: {len(test_df)} giri")
 
-    model = Pipeline([
-        ("scaler", StandardScaler()),
-        ("gbr", GradientBoostingRegressor(
-            n_estimators=300,
-            max_depth=5,
-            learning_rate=0.07,
-            subsample=0.8,
-            min_samples_leaf=10,
-            random_state=42,
-        )),
-    ])
+    X_train, y_train = build_lap_features(train_df)
+    X_test, y_test = build_lap_features(test_df)
+
+    model = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "gbr",
+                GradientBoostingRegressor(
+                    n_estimators=300,
+                    max_depth=5,
+                    learning_rate=0.07,
+                    subsample=0.8,
+                    min_samples_leaf=10,
+                    random_state=42,
+                ),
+            ),
+        ]
+    )
 
     model.fit(X_train, y_train)
 
-    # Valutazione
     preds = model.predict(X_test)
-    mae   = mean_absolute_error(y_test, preds)
-    rmse  = math.sqrt(mean_squared_error(y_test, preds))
-    r2    = model.score(X_test, y_test)
+    mae = mean_absolute_error(y_test, preds)
+    rmse = math.sqrt(mean_squared_error(y_test, preds))
+    r2 = model.score(X_test, y_test)
 
-    # Cross-validation
-    cv_scores = cross_val_score(model, X, y, cv=5, scoring="neg_mean_absolute_error")
+    # Cross-validation solo sul train set (corretto: non tocca il test)
+    cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring="neg_mean_absolute_error")
     cv_mae = -cv_scores.mean()
 
     logger.info(f"  MAE  test: {mae:.4f}s")
     logger.info(f"  RMSE test: {rmse:.4f}s")
     logger.info(f"  R²   test: {r2:.4f}")
-    logger.info(f"  CV MAE (5-fold): {cv_mae:.4f}s")
+    logger.info(f"  CV MAE (5-fold, solo train): {cv_mae:.4f}s")
 
-    # Feature importance
     gbr = model.named_steps["gbr"]
-    importance = dict(zip(LAP_FEATURES, gbr.feature_importances_.tolist()))
+    importance = dict(zip(LAP_FEATURES, gbr.feature_importances_.tolist(), strict=False))
     logger.info("  Feature importance:")
     for feat, imp in sorted(importance.items(), key=lambda x: x[1], reverse=True):
         bar = "█" * int(imp * 40)
         logger.info(f"    {feat:<16} {imp:.3f}  {bar}")
 
-    # Salva
     path = MODEL_DIR / "lap_time_model.pkl"
     with open(path, "wb") as f:
         pickle.dump({"model": model, "features": LAP_FEATURES}, f)
@@ -166,40 +226,59 @@ def train_lap_time_model(df: pd.DataFrame) -> dict:
     }
 
 
-# ── Modello 2: DegradationModel (per compound) ────────────────────────────────
+# ── Modello 2: DegradationModel ───────────────────────────────────────────────
+def train_degradation_model(df: pd.DataFrame, test_circuit: str | None = None) -> dict:
+    logger.info("\n=== Training DegradationModel (Enhanced Ridge polynomial) ===")
 
-def train_degradation_model(df: pd.DataFrame) -> dict:
-    logger.info("\n=== Training DegradationModel (Ridge polynomial) ===")
+    # Split train/test anche qui: valuta se il degrado appreso generalizza
+    train_df, test_df = _temporal_split(df, test_circuit)
 
     results = {}
     models = {}
 
     for compound in COMPOUND_ENC:
-        sub = df[df["compound"] == compound].copy()
-        if len(sub) < 30:
-            logger.warning(f"  {compound}: troppo pochi dati ({len(sub)} giri), skip")
+        sub_train = train_df[train_df["compound"] == compound]
+        sub_test = test_df[test_df["compound"] == compound]
+
+        if len(sub_train) < 30:
+            logger.warning(f"  {compound}: troppo pochi dati in train ({len(sub_train)} giri), skip")
             continue
 
-        # Solo giri dry (senza pioggia) per misurare degrado puro
-        sub_dry = sub[sub["weather_enc"] == 0]
-        if len(sub_dry) < 20:
-            sub_dry = sub
+        # Solo giri dry per misurare degrado puro
+        sub_train_dry = sub_train[sub_train["weather_enc"] == 0]
+        sub_test_dry = sub_test[sub_test["weather_enc"] == 0]
+        if len(sub_train_dry) < 20:
+            sub_train_dry = sub_train
+            sub_test_dry = sub_test
 
-        X = sub_dry[["stint_lap"]].values.astype(np.float32)
-        y = sub_dry["lap_duration"].values.astype(np.float32)
+        X_train = sub_train_dry[["stint_lap"]].values.astype(np.float32)
+        X_test = sub_test_dry[["stint_lap"]].values.astype(np.float32) if len(sub_test_dry) > 0 else None
 
-        # Normalizza: riferimento = mediana del primo stint_lap (0-2)
-        baseline_mask = sub_dry["stint_lap"] <= 2
-        baseline = sub_dry.loc[baseline_mask, "lap_duration"].median() if baseline_mask.any() else y.mean()
-        y_delta = y - baseline  # lavoriamo sul delta rispetto al giro fresco
+        # Target = delta rispetto al giro fresco (stint_lap <= 2) del train set
+        baseline_mask = sub_train_dry["stint_lap"] <= 2
+        baseline = (
+            sub_train_dry.loc[baseline_mask, "lap_duration"].median()
+            if baseline_mask.any()
+            else sub_train_dry["lap_duration"].mean()
+        )
+        y_train = sub_train_dry["lap_duration"].values.astype(np.float32) - baseline
 
-        pipe = Pipeline([
-            ("poly", PolynomialFeatures(degree=2, include_bias=True)),
-            ("ridge", Ridge(alpha=1.0)),
-        ])
-        pipe.fit(X, y_delta)
+        pipe = Pipeline(
+            [
+                ("poly", PolynomialFeatures(degree=2, include_bias=True)),
+                ("ridge", Ridge(alpha=1.0)),
+            ]
+        )
+        pipe.fit(X_train, y_train)
 
-        # Stima stint ottimale: quanti giri prima di +2s di degrado
+        # Valutazione sul test set (se disponibile)
+        test_mae = None
+        if X_test is not None and len(X_test) > 0:
+            y_test = sub_test_dry["lap_duration"].values.astype(np.float32) - baseline
+            preds = pipe.predict(X_test)
+            test_mae = round(float(mean_absolute_error(y_test, preds)), 4)
+
+        # Stima cliff: giri prima di +2s di degrado
         opt_lap = 1
         for lap in range(1, 55):
             delta_pred = pipe.predict(np.array([[lap]]))[0]
@@ -207,7 +286,6 @@ def train_degradation_model(df: pd.DataFrame) -> dict:
                 break
             opt_lap = lap
 
-        # Coefficienti
         ridge = pipe.named_steps["ridge"]
         coefs = {
             "intercept": round(float(ridge.intercept_), 4),
@@ -215,13 +293,18 @@ def train_degradation_model(df: pd.DataFrame) -> dict:
             "coef_quad": round(float(ridge.coef_[2]), 6),
             "estimated_optimal_stint_laps": opt_lap,
             "baseline_lap_time": round(float(baseline), 3),
-            "n_samples": len(sub_dry),
+            "n_train": len(sub_train_dry),
+            "n_test": len(sub_test_dry) if sub_test_dry is not None else 0,
+            "test_mae": test_mae,
         }
         results[compound] = coefs
         models[compound] = pipe
 
-        logger.info(f"  {compound:<14} deg/lap≈{coefs['coef_linear']:.4f}s  "
-                    f"cliff≈{opt_lap}giri  n={len(sub_dry)}")
+        mae_str = f"  test_MAE={test_mae:.4f}s" if test_mae is not None else "  test_MAE=N/A"
+        logger.info(
+            f"  {compound:<14} deg/lap≈{coefs['coef_linear']:.4f}s  "
+            f"cliff≈{opt_lap}giri  n_train={len(sub_train_dry)}{mae_str}"
+        )
 
     path = MODEL_DIR / "degradation_model.pkl"
     with open(path, "wb") as f:
@@ -232,49 +315,61 @@ def train_degradation_model(df: pd.DataFrame) -> dict:
 
 
 # ── Modello 3: CompoundRecommender ────────────────────────────────────────────
-
-def train_compound_recommender(df: pd.DataFrame) -> dict:
-    """
-    Per ogni stint (groupby driver+session+compound sequence), calcola il
-    tempo totale dello stint e confronta con gli altri compound disponibili
-    in condizioni simili. Label = compound che ha dato il minor tempo medio
-    in quella finestra meteo e lunghezza stint.
-    """
+def train_compound_recommender(df: pd.DataFrame, test_circuit: str | None = None) -> dict:
     logger.info("\n=== Training CompoundRecommender (RandomForest) ===")
 
-    # Aggrega per stint
-    stint_groups = df.groupby(["session_key", "driver_number", "compound"]).agg(
-        n_laps=("lap_duration", "count"),
-        total_time=("lap_duration", "sum"),
-        avg_lap=("lap_duration", "mean"),
-        weather_enc=("weather_enc", "median"),
-        air_temp=("air_temp", "median"),
-        track_temp=("track_temp", "median"),
-    ).reset_index()
+    group_cols = ["session_key", "driver_number", "compound"]
+    if "location" in df.columns:
+        group_cols.append("location")
+
+    # Aggrega per stint prima di splittare
+    stint_groups = (
+        df.groupby(group_cols)
+        .agg(
+            n_laps=("lap_duration", "count"),
+            weather_enc=("weather_enc", "median"),
+            air_temp=("air_temp", "median"),
+            track_temp=("track_temp", "median"),
+            lap_start=("lap_number", "min"),
+            speed_avg=("speed_mean", "mean"),
+            sec1_deg=("duration_sector_1_norm", "mean"),
+            sec2_deg=("duration_sector_2_norm", "mean"),
+            sec3_deg=("duration_sector_3_norm", "mean"),
+        )
+        .reset_index()
+    )
 
     if len(stint_groups) < 50:
         logger.warning("  Troppo pochi stint aggregati, il recommender potrebbe essere inaccurato")
 
-    # Feature per ogni stint
-    X = stint_groups[["n_laps", "weather_enc", "air_temp", "track_temp"]].values.astype(np.float32)
+    # Split temporale sugli stint (stesso criterio degli altri modelli)
+    train_stint, test_stint = _temporal_split(stint_groups, test_circuit)
 
-    # Aggiungi sqrt(n_laps) per catturare non-linearità
-    X = np.hstack([X, np.sqrt(X[:, 0:1])])
+    def make_X(sdf):
+        feats = [
+            "n_laps",
+            "weather_enc",
+            "air_temp",
+            "track_temp",
+            "lap_start",
+            "speed_avg",
+            "sec1_deg",
+            "sec2_deg",
+            "sec3_deg",
+        ]
+        X = sdf[feats].values.astype(np.float32)
+        return np.hstack([X, np.sqrt(X[:, 0:1])])
 
-    # Label = compound (classificazione)
+    X_train = make_X(train_stint)
+    X_test = make_X(test_stint)
+
     le = LabelEncoder()
-    y = le.fit_transform(stint_groups["compound"].values)
-
-    # NOTA: il label ideale sarebbe "il compound col minor avg_lap in quella
-    # sessione per quella lunghezza stint". Con più dati puoi raffinare questo
-    # confrontando stint dello stesso giro con compound diversi.
-    # Con dati reali, il proxy migliore è: RandomForest impara quali compound
-    # vengono scelti dagli strategist in quelle condizioni (revealed preference).
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    le.fit(stint_groups["compound"].values)
+    y_train = le.transform(train_stint["compound"].values)
+    y_test = le.transform(test_stint["compound"].values)
 
     model = RandomForestClassifier(
-        n_estimators=200,
+        n_estimators=500,
         max_depth=8,
         min_samples_leaf=5,
         random_state=42,
@@ -283,12 +378,22 @@ def train_compound_recommender(df: pd.DataFrame) -> dict:
     model.fit(X_train, y_train)
 
     acc = model.score(X_test, y_test)
-    logger.info(f"  Accuracy test: {acc:.3f}")
+    logger.info(f"  Accuracy test: {acc:.3f}  (train={len(X_train)}, test={len(X_test)})")
     logger.info(f"  Classi: {list(le.classes_)}")
 
-    # Feature importance
-    feat_names = ["n_laps", "weather_enc", "air_temp", "track_temp", "sqrt_n_laps"]
-    importance = dict(zip(feat_names, model.feature_importances_.tolist()))
+    feat_names = [
+        "n_laps",
+        "weather_enc",
+        "air_temp",
+        "track_temp",
+        "lap_start",
+        "speed_avg",
+        "sec1_deg",
+        "sec2_deg",
+        "sec3_deg",
+        "sqrt_n_laps",
+    ]
+    importance = dict(zip(feat_names, model.feature_importances_.tolist(), strict=False))
     logger.info("  Feature importance:")
     for feat, imp in sorted(importance.items(), key=lambda x: x[1], reverse=True):
         logger.info(f"    {feat:<16} {imp:.3f}")
@@ -301,6 +406,7 @@ def train_compound_recommender(df: pd.DataFrame) -> dict:
     return {
         "type": "RandomForestClassifier",
         "n_train": len(X_train),
+        "n_test": len(X_test),
         "accuracy_test": round(acc, 4),
         "classes": list(le.classes_),
         "feature_importance": {k: round(v, 4) for k, v in importance.items()},
@@ -308,7 +414,6 @@ def train_compound_recommender(df: pd.DataFrame) -> dict:
 
 
 # ── Training report ────────────────────────────────────────────────────────────
-
 def save_training_report(reports: dict, df: pd.DataFrame):
     report = {
         "dataset": {
@@ -319,9 +424,9 @@ def save_training_report(reports: dict, df: pd.DataFrame):
             "weather_distribution": df["weather_enc"].value_counts().to_dict(),
             "lap_time_stats": {
                 "mean": round(df["lap_duration"].mean(), 3),
-                "std":  round(df["lap_duration"].std(), 3),
-                "min":  round(df["lap_duration"].min(), 3),
-                "max":  round(df["lap_duration"].max(), 3),
+                "std": round(df["lap_duration"].std(), 3),
+                "min": round(df["lap_duration"].min(), 3),
+                "max": round(df["lap_duration"].max(), 3),
             },
         },
         "models": reports,
@@ -333,16 +438,12 @@ def save_training_report(reports: dict, df: pd.DataFrame):
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
-
-def run(csv_path: Path = None):
+def run(csv_path: Path | None = None, test_circuit: str | None = None):
     if csv_path is None:
-        csv_path = DATA_DIR / "laps_raw.csv"
+        csv_path = DATA_DIR / "all_circuits_laps.csv"
 
     if not csv_path.exists():
-        logger.error(
-            f"Dataset non trovato: {csv_path}\n"
-            f"Esegui prima: python collect_training_data.py"
-        )
+        logger.error(f"Dataset non trovato: {csv_path}\nEsegui prima: python collect_training_data.py")
         return None
 
     df = load_and_clean(csv_path)
@@ -352,23 +453,31 @@ def run(csv_path: Path = None):
         return None
 
     reports = {}
-    reports["lap_time_model"]       = train_lap_time_model(df)
-    reports["degradation_model"]    = train_degradation_model(df)
-    reports["compound_recommender"] = train_compound_recommender(df)
+    reports["lap_time_model"] = train_lap_time_model(df, test_circuit)
+    reports["degradation_model"] = train_degradation_model(df, test_circuit)
+    reports["compound_recommender"] = train_compound_recommender(df, test_circuit)
 
     report = save_training_report(reports, df)
 
     logger.info("\n=== Training completato ===")
     logger.info(f"Modelli salvati in: {MODEL_DIR}/")
-    logger.info(f"Prossimo step: python main.py  (usa automaticamente i modelli in models/)")
+    logger.info("Prossimo step: python src/f1_strategy/main.py")
 
     return report
 
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser(description="Addestra modelli ML su dati reali OpenF1")
-    parser.add_argument("--data", type=str, default=None, help="Path al CSV (default: data/laps_raw.csv)")
+    parser.add_argument("--data", type=str, default=None, help="Path al CSV")
+    parser.add_argument(
+        "--test-circuit",
+        type=str,
+        default=None,
+        help="Circuito da usare come test set (es. 'Monza'). Default: split temporale.",
+    )
     args = parser.parse_args()
 
-    run(csv_path=Path(args.data) if args.data else None)
+    run(
+        csv_path=Path(args.data) if args.data else None,
+        test_circuit=args.test_circuit,
+    )

@@ -218,11 +218,14 @@ LAP_FIELDS = [
     "i1_speed",
     "i2_speed",
     "st_speed",
+    "location",
+    "circuit_short_name",
+    "year",
 ]
 
 
 def save_laps_csv(all_laps: list[dict], path: Path):
-    with open(path, "w", newline="") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=LAP_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(all_laps)

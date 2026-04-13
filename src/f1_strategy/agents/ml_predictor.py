@@ -27,11 +27,12 @@ logger = logging.getLogger(__name__)
 MODEL_DIR = Path(__file__).parent.parent.parent / "models"
 
 COMPOUND_ENC = {"soft": 0, "medium": 1, "hard": 2, "intermediate": 3, "wet": 4}
-WEATHER_ENC  = {"dry": 0, "light_rain": 1, "heavy_rain": 2}
+WEATHER_ENC = {"dry": 0, "light_rain": 1, "heavy_rain": 2}
 
 
 class ModelNotTrainedError(RuntimeError):
     """Sollevato quando i modelli non sono stati ancora addestrati."""
+
     def __init__(self, model_name: str):
         super().__init__(
             f"\n[ML] Modello '{model_name}' non trovato in {MODEL_DIR}/\n"
@@ -50,7 +51,6 @@ def _load_pickle(filename: str) -> dict:
 
 
 # ── LapTimePredictor ──────────────────────────────────────────────────────────
-
 class LapTimePredictor:
     """
     Wrapper attorno al GradientBoostingRegressor addestrato su dati reali.
@@ -59,7 +59,7 @@ class LapTimePredictor:
 
     def __init__(self):
         payload = _load_pickle("lap_time_model.pkl")
-        self.model    = payload["model"]
+        self.model = payload["model"]
         self.features = payload["features"]
         logger.info("LapTimePredictor caricato da dati reali ✓")
 
@@ -72,18 +72,23 @@ class LapTimePredictor:
         air_temp: float = 25.0,
         lap_number: int = 1,
     ) -> float:
-        X = np.array([[
-            COMPOUND_ENC.get(compound.lower(), 1),
-            stint_lap,
-            stint_lap ** 2,
-            WEATHER_ENC.get(weather, 0),
-            air_temp,
-            track_temp,
-            lap_number,
-        ]], dtype=np.float32)
+        np.array(
+            [
+                [
+                    COMPOUND_ENC.get(compound.lower(), 1),
+                    stint_lap,
+                    stint_lap**2,
+                    WEATHER_ENC.get(weather, 0),
+                    air_temp,
+                    track_temp,
+                    lap_number,
+                ]
+            ],
+            dtype=np.float32,
+        )
         # Riordina secondo l'ordine di feature del training
         feature_order = {f: i for i, f in enumerate(self.features)}
-        col_map = [
+        [
             feature_order.get("compound_enc", 0),
             feature_order.get("stint_lap", 1),
             feature_order.get("stint_lap_sq", 2),
@@ -93,15 +98,20 @@ class LapTimePredictor:
             feature_order.get("lap_number", 6),
         ]
         # Costruisci X nell'ordine corretto
-        X_ordered = np.array([[
-            COMPOUND_ENC.get(compound.lower(), 1),
-            stint_lap,
-            stint_lap ** 2,
-            WEATHER_ENC.get(weather, 0),
-            air_temp,
-            track_temp,
-            lap_number,
-        ]], dtype=np.float32)
+        X_ordered = np.array(
+            [
+                [
+                    COMPOUND_ENC.get(compound.lower(), 1),
+                    stint_lap,
+                    stint_lap**2,
+                    WEATHER_ENC.get(weather, 0),
+                    air_temp,
+                    track_temp,
+                    lap_number,
+                ]
+            ],
+            dtype=np.float32,
+        )
         return float(self.model.predict(X_ordered)[0])
 
     def evaluate(self, X_test=None, y_test=None) -> dict:
@@ -118,11 +128,10 @@ class LapTimePredictor:
             report = json.loads(report_path.read_text())
             return report.get("models", {}).get("lap_time_model", {}).get("feature_importance", {})
         gbr = self.model.named_steps["gbr"]
-        return dict(zip(self.features, gbr.feature_importances_.tolist()))
+        return dict(zip(self.features, gbr.feature_importances_.tolist(), strict=False))
 
 
 # ── DegradationModel ──────────────────────────────────────────────────────────
-
 class DegradationModel:
     """
     Wrapper attorno ai modelli Ridge polynomial addestrati per compound.
@@ -131,7 +140,7 @@ class DegradationModel:
 
     def __init__(self):
         payload = _load_pickle("degradation_model.pkl")
-        self.models       = payload["models"]
+        self.models = payload["models"]
         self.coefficients = payload["coefficients"]
         logger.info(f"DegradationModel caricato per: {list(self.models.keys())} ✓")
 
@@ -151,15 +160,11 @@ class DegradationModel:
     def summary(self) -> dict:
         return {
             "coefficients": self.coefficients,
-            "optimal_stint_lengths": {
-                c: self.get_optimal_stint_length(c)
-                for c in self.coefficients
-            },
+            "optimal_stint_lengths": {c: self.get_optimal_stint_length(c) for c in self.coefficients},
         }
 
 
 # ── CompoundRecommender ───────────────────────────────────────────────────────
-
 class CompoundRecommender:
     """
     Wrapper attorno al RandomForestClassifier addestrato su stint reali.
@@ -168,9 +173,9 @@ class CompoundRecommender:
 
     def __init__(self):
         payload = _load_pickle("compound_recommender.pkl")
-        self.model         = payload["model"]
+        self.model = payload["model"]
         self.label_encoder = payload["label_encoder"]
-        self.features      = payload["features"]
+        self.features = payload["features"]
         logger.info("CompoundRecommender caricato da dati reali ✓")
 
     def recommend(
@@ -182,21 +187,26 @@ class CompoundRecommender:
         air_temp: float = 25.0,
     ) -> dict:
         weather_enc = WEATHER_ENC.get(weather, 0)
-        X = np.array([[
-            n_laps,
-            weather_enc,
-            air_temp,
-            track_temp,
-            n_laps ** 0.5,
-        ]], dtype=np.float32)
+        X = np.array(
+            [
+                [
+                    n_laps,
+                    weather_enc,
+                    air_temp,
+                    track_temp,
+                    n_laps**0.5,
+                ]
+            ],
+            dtype=np.float32,
+        )
 
-        pred_enc   = int(self.model.predict(X)[0])
-        proba      = self.model.predict_proba(X)[0]
-        classes    = self.model.classes_
-        compound   = self.label_encoder.inverse_transform([pred_enc])[0]
+        pred_enc = int(self.model.predict(X)[0])
+        proba = self.model.predict_proba(X)[0]
+        classes = self.model.classes_
+        compound = self.label_encoder.inverse_transform([pred_enc])[0]
 
         proba_dict = {}
-        for cls, p in zip(classes, proba):
+        for cls, p in zip(classes, proba, strict=False):
             name = self.label_encoder.inverse_transform([int(cls)])[0]
             proba_dict[name] = round(float(p), 3)
 
@@ -208,7 +218,6 @@ class CompoundRecommender:
 
 
 # ── StrategyEvaluator ─────────────────────────────────────────────────────────
-
 class StrategyEvaluator:
     """
     Combina LapTimePredictor + DegradationModel + CompoundRecommender
@@ -216,12 +225,12 @@ class StrategyEvaluator:
     """
 
     def __init__(self):
-        self.lap_model   = LapTimePredictor()
-        self.deg_model   = DegradationModel()
+        self.lap_model = LapTimePredictor()
+        self.deg_model = DegradationModel()
         self.recommender = CompoundRecommender()
 
     @classmethod
-    def load(cls) -> "StrategyEvaluator":
+    def load(cls) -> StrategyEvaluator:
         """Carica tutti i modelli. Lancia ModelNotTrainedError se mancano."""
         return cls()
 
@@ -235,19 +244,19 @@ class StrategyEvaluator:
         """
         Simula giro per giro usando il LapTimePredictor reale.
         """
-        total_laps    = conditions.get("total_laps", 53)
-        pit_loss      = conditions.get("pit_lane_time_loss_seconds", 22.5)
-        sc_info       = conditions.get("safety_car", {})
-        sc_active     = sc_info.get("active", False)
-        sc_lap        = sc_info.get("lap", -1)
-        sc_duration   = sc_info.get("duration_laps", 0)
-        rain_start    = conditions.get("weather", {}).get("rain_start_lap", 999)
+        total_laps = conditions.get("total_laps", 53)
+        pit_loss = conditions.get("pit_lane_time_loss_seconds", 22.5)
+        sc_info = conditions.get("safety_car", {})
+        sc_active = sc_info.get("active", False)
+        sc_lap = sc_info.get("lap", -1)
+        sc_duration = sc_info.get("duration_laps", 0)
+        rain_start = conditions.get("weather", {}).get("rain_start_lap", 999)
         rain_intensity = conditions.get("weather", {}).get("rain_intensity", "none")
 
         sorted_strat = sorted(strategy, key=lambda x: x["start_lap"])
         stints_ext = []
         for i, s in enumerate(sorted_strat):
-            end_lap = sorted_strat[i+1]["start_lap"] - 1 if i+1 < len(sorted_strat) else total_laps
+            end_lap = sorted_strat[i + 1]["start_lap"] - 1 if i + 1 < len(sorted_strat) else total_laps
             stints_ext.append({**s, "end_lap": end_lap, "compound": s["compound"].lower()})
 
         lap_to_stint = {}
@@ -266,39 +275,33 @@ class StrategyEvaluator:
                 total_time += 90.0
                 continue
 
-            compound  = stint["compound"]
+            compound = stint["compound"]
             stint_lap = lap - stint["start_lap"]
 
-            if lap >= rain_start:
-                weather = "heavy_rain" if rain_intensity == "heavy" else "light_rain"
-            else:
-                weather = "dry"
+            weather = ("heavy_rain" if rain_intensity == "heavy" else "light_rain") if lap >= rain_start else "dry"
 
             is_sc = sc_active and sc_lap <= lap < sc_lap + sc_duration
 
-            if is_sc:
-                lap_time = 108.0
-            else:
-                lap_time = self.lap_model.predict(
-                    compound, stint_lap, weather, track_temp, air_temp, lap
-                )
+            lap_time = 108.0 if is_sc else self.lap_model.predict(compound, stint_lap, weather, track_temp, air_temp, lap)
 
             is_pit = lap == stint["start_lap"] and lap > 1
             if is_pit:
                 total_time += pit_loss
-                pit_stops  += 1
+                pit_stops += 1
 
             total_time += lap_time
             per_compound[compound] = per_compound.get(compound, 0.0) + lap_time
-            lap_results.append({
-                "lap": lap,
-                "lap_time": round(lap_time, 3),
-                "compound": compound,
-                "stint_lap": stint_lap,
-                "weather": weather,
-                "is_pit_lap": is_pit,
-                "is_sc_lap": is_sc,
-            })
+            lap_results.append(
+                {
+                    "lap": lap,
+                    "lap_time": round(lap_time, 3),
+                    "compound": compound,
+                    "stint_lap": stint_lap,
+                    "weather": weather,
+                    "is_pit_lap": is_pit,
+                    "is_sc_lap": is_sc,
+                }
+            )
 
         return {
             "strategy": strategy,
@@ -314,54 +317,59 @@ class StrategyEvaluator:
 
     def recommend_strategy(self, conditions: dict, track_temp: float = 38.0) -> dict:
         """Raccomanda compound per ogni stint usando il modello reale."""
-        total_laps   = conditions.get("total_laps", 53)
-        rain_start   = conditions.get("weather", {}).get("rain_start_lap", 999)
-        sc_lap       = (
-            conditions.get("safety_car", {}).get("lap", -1)
-            if conditions.get("safety_car", {}).get("active")
-            else -1
-        )
+        total_laps = conditions.get("total_laps", 53)
+        rain_start = conditions.get("weather", {}).get("rain_start_lap", 999)
+        sc_lap = conditions.get("safety_car", {}).get("lap", -1) if conditions.get("safety_car", {}).get("active") else -1
 
         suggestions = []
-        stint_num   = 1
+        stint_num = 1
 
         # Stint 1: asciutto fino a SC o pioggia
         end1 = sc_lap if sc_lap > 0 else (rain_start - 1 if rain_start < total_laps else total_laps)
-        n1   = max(1, end1 - 1)
+        n1 = max(1, end1 - 1)
         rec1 = self.recommender.recommend(n1, "dry", stint_position=0, track_temp=track_temp)
-        suggestions.append({
-            "stint": stint_num, "start_lap": 1,
-            "recommended_compound": rec1["best_compound"],
-            "confidence": rec1["confidence"],
-            "probabilities": rec1["probabilities"],
-            "rationale": f"{n1} giri su asciutto",
-        })
+        suggestions.append(
+            {
+                "stint": stint_num,
+                "start_lap": 1,
+                "recommended_compound": rec1["best_compound"],
+                "confidence": rec1["confidence"],
+                "probabilities": rec1["probabilities"],
+                "rationale": f"{n1} giri su asciutto",
+            }
+        )
         stint_num += 1
 
         # Stint 2: se c'è SC prima della pioggia
         if sc_lap > 0 and rain_start < total_laps and sc_lap < rain_start:
-            n2   = max(1, rain_start - sc_lap)
+            n2 = max(1, rain_start - sc_lap)
             rec2 = self.recommender.recommend(n2, "dry", stint_position=1, track_temp=track_temp)
-            suggestions.append({
-                "stint": stint_num, "start_lap": sc_lap,
-                "recommended_compound": rec2["best_compound"],
-                "confidence": rec2["confidence"],
-                "probabilities": rec2["probabilities"],
-                "rationale": f"{n2} giri su asciutto (post-SC)",
-            })
+            suggestions.append(
+                {
+                    "stint": stint_num,
+                    "start_lap": sc_lap,
+                    "recommended_compound": rec2["best_compound"],
+                    "confidence": rec2["confidence"],
+                    "probabilities": rec2["probabilities"],
+                    "rationale": f"{n2} giri su asciutto (post-SC)",
+                }
+            )
             stint_num += 1
 
         # Stint finale: con pioggia
         if rain_start < total_laps:
             n_rain = total_laps - rain_start + 1
-            rec_r  = self.recommender.recommend(n_rain, "light_rain", stint_position=2, track_temp=track_temp)
-            suggestions.append({
-                "stint": stint_num, "start_lap": rain_start,
-                "recommended_compound": rec_r["best_compound"],
-                "confidence": rec_r["confidence"],
-                "probabilities": rec_r["probabilities"],
-                "rationale": f"{n_rain} giri con pioggia leggera",
-            })
+            rec_r = self.recommender.recommend(n_rain, "light_rain", stint_position=2, track_temp=track_temp)
+            suggestions.append(
+                {
+                    "stint": stint_num,
+                    "start_lap": rain_start,
+                    "recommended_compound": rec_r["best_compound"],
+                    "confidence": rec_r["confidence"],
+                    "probabilities": rec_r["probabilities"],
+                    "rationale": f"{n_rain} giri con pioggia leggera",
+                }
+            )
 
         return {"ml_recommended_stints": suggestions}
 
