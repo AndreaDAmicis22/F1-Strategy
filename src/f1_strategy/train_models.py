@@ -145,13 +145,13 @@ LAP_FEATURES = [
     "air_temp",
     "track_temp",
     "lap_number",
-    "duration_sector_1_norm",  # degrado settore 1
-    "duration_sector_2_norm",  # degrado settore 2
-    "duration_sector_3_norm",  # degrado settore 3
-    "speed_mean",  # grip medio
-    "speed_range",  # bilanciamento aero/gomme
-    "humidity",  # condizioni aria
-    "wind_speed",  # vento (impatta downforce a Monza)
+    "duration_sector_1_norm",
+    "duration_sector_2_norm",
+    "duration_sector_3_norm",
+    "speed_mean",
+    "speed_range",
+    "humidity",
+    "wind_speed",
 ]
 
 

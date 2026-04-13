@@ -123,7 +123,7 @@ def run_pipeline(conditions_path=None, skip_api=False):
     simulation_result = simulator.find_optimal_strategy(
         conditions,
         historical_patterns=patterns,
-        ml_evaluator=ml_evaluator,  # ← ML decide tutto
+        ml_evaluator=ml_evaluator,
     )
 
     ranking = simulation_result.get("ranking", [])
@@ -147,7 +147,7 @@ def run_pipeline(conditions_path=None, skip_api=False):
 
     # STEP 5: Output files
     logger.info("\n[4/4] Salvataggio output...")
-    output_dir = Path(__file__).parent / "outputs"
+    output_dir = Path(__file__).parent.parent.parent / "outputs"
     output_paths = reporter.save_outputs(
         conditions=conditions,
         historical_analysis=historical_analysis,

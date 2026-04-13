@@ -265,7 +265,8 @@ class StrategyEvaluator:
 
             is_pit = lap == stint["start_lap"] and lap > 1
             if is_pit:
-                total_time += pit_loss
+                current_pit_loss = pit_loss * 0.55 if is_sc else pit_loss
+                total_time += current_pit_loss
                 pit_stops += 1
 
             total_time += lap_time
