@@ -1,17 +1,16 @@
 """
 train_models.py
 ===============
-Addestra i modelli ML sui dati REALI scaricati da OpenF1 (via collect_training_data.py).
+Addestra 3 modelli ML su dati reali OpenF1:
+
+  1. LapTimePredictor      — GBR: stima il tempo giro (compound, stint_lap, meteo, temp)
+  2. DegradationRiskModel  — Ridge poly per compound: stima degrado e cliff
+  3. SafetyCarImpactModel  — GBR: stima secondi guadagnati/persi in base alla
+                             sincronizzazione pit stop ↔ Safety Car
 
 Uso:
     python src/f1_strategy/train_models.py --data data/all_circuits_laps.csv
     python src/f1_strategy/train_models.py --data data/all_circuits_laps.csv --test-circuit Monza
-
-Output:
-    models/lap_time_model.pkl        — GradientBoostingRegressor tempi giro
-    models/degradation_model.pkl     — Ridge polinomiale degrado per compound
-    models/compound_recommender.pkl  — RandomForest classificatore compound
-    models/training_report.json      — metriche, feature importance, distribuzione dati
 """
 
 import argparse
@@ -23,12 +22,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
+from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import cross_val_score
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import LabelEncoder, PolynomialFeatures, StandardScaler
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("trainer")
@@ -38,105 +37,105 @@ MODEL_DIR = Path(__file__).parent.parent.parent / "models"
 MODEL_DIR.mkdir(exist_ok=True)
 
 COMPOUND_ENC = {"soft": 0, "medium": 1, "hard": 2, "intermediate": 3, "wet": 4}
-
 LAP_TIME_MIN = 60.0
 LAP_TIME_MAX = 200.0
 
 
-# ── Carica e pulisce il dataset ────────────────────────────────────────────────
-def load_and_clean(csv_path: Path) -> pd.DataFrame:
+# ── Carica e pulisce ───────────────────────────────────────────────────────────
+def load_and_clean(csv_path: Path, erase_stop_sc: bool = True) -> pd.DataFrame:
     logger.info(f"Caricamento dati: {csv_path}")
     df = pd.read_csv(csv_path, encoding="utf-8", encoding_errors="replace")
     logger.info(f"  Righe raw: {len(df)}")
 
     df = df[df["lap_duration"].between(LAP_TIME_MIN, LAP_TIME_MAX)]
     df = df[df["compound"].isin(COMPOUND_ENC.keys())]
-    df = df[df["is_pit_out_lap"] != True]  # noqa: E712
-    df = df[df["is_sc_lap"] != True]  # noqa: E712
+    if erase_stop_sc:
+        df = df[df["is_pit_out_lap"] != True]  # noqa: E712
+        df = df[df["is_sc_lap"] != True]  # noqa: E712
 
     df["compound_enc"] = df["compound"].map(COMPOUND_ENC)
-
     df["rainfall"] = df["rainfall"].fillna(0.0)
     df["weather_enc"] = df["rainfall"].apply(lambda r: 2 if r > 2.0 else (1 if r > 0.1 else 0))
 
-    df["air_temp"] = df.groupby("session_key")["air_temp"].transform(lambda x: x.fillna(x.median()))
-    df["track_temp"] = df.groupby("session_key")["track_temp"].transform(lambda x: x.fillna(x.median()))
-    df["air_temp"] = df["air_temp"].fillna(25.0)
-    df["track_temp"] = df["track_temp"].fillna(38.0)
+    for col in ["air_temp", "track_temp"]:
+        df[col] = df.groupby("session_key")[col].transform(lambda x: x.fillna(x.median()))
+        df[col] = df[col].fillna(df[col].median())
 
     df["stint_lap_sq"] = df["stint_lap"] ** 2
-
-    # Normalizza il tempo giro rispetto al best pace della sessione.
-    # Rimuove l'effetto "circuito diverso" (Monaco 75s vs Monza 83s vs Spa 107s) e lascia solo il segnale di degrado relativo.
     df["lap_duration_norm"] = df.groupby("session_key")["lap_duration"].transform(lambda x: x - x.quantile(0.05))
 
-    # Velocità medie: proxy diretto del grip disponibile
     df["speed_mean"] = df[["i1_speed", "i2_speed", "st_speed"]].mean(axis=1)
-    # Differenza velocità tra tratti: indica bilanciamento aerodinamico/gomme
     df["speed_range"] = df["st_speed"] - df[["i1_speed", "i2_speed"]].min(axis=1)
 
-    # Settori normalizzati per sessione (stesso motivo di lap_duration_norm)
     for sec in ["duration_sector_1", "duration_sector_2", "duration_sector_3"]:
         df[f"{sec}_norm"] = df.groupby("session_key")[sec].transform(lambda x: x - x.quantile(0.05))
 
-    # Imputa NaN nelle colonne nuove
-    speed_cols = ["i1_speed", "i2_speed", "st_speed", "speed_mean", "speed_range"]
-    sector_cols = ["duration_sector_1_norm", "duration_sector_2_norm", "duration_sector_3_norm"]
-    for col in speed_cols + sector_cols:
+    for col in ["speed_mean", "speed_range", "duration_sector_1_norm", "duration_sector_2_norm", "duration_sector_3_norm"]:
         df[col] = df.groupby(["session_key", "compound"])[col].transform(lambda x: x.fillna(x.median()))
         df[col] = df[col].fillna(df[col].median())
-
-    for col in sector_cols + speed_cols:
-        null_pct = df[col].isna().mean()
-        if null_pct > 0.3:
-            logger.warning(f"  {col}: {null_pct:.0%} NaN dopo imputazione, esclusa dalle features")
-            LAP_FEATURES.remove(col) if col in LAP_FEATURES else None
 
     df["humidity"] = df["humidity"].fillna(df["humidity"].median())
     df["wind_speed"] = df["wind_speed"].fillna(0.0)
 
+    df["avg_energy_session"] = (
+        df.groupby("session_key")
+        .apply(lambda x: (x["speed_mean"] * x["track_temp"]).mean())
+        .reindex(df["session_key"])
+        .values
+    )
+
+    # 1. Feature di Progressione e Efficienza
+    df["session_progression"] = df.groupby("session_key")["lap_number"].transform(lambda x: x / x.max())
+    df["max_speed_session"] = df.groupby("session_key")["st_speed"].transform("max")
+    df["speed_efficiency"] = (df["st_speed"] / df["max_speed_session"]).fillna(1.0)  # 1.0 è il default neutro
+    df["speed_efficiency"] = df["speed_efficiency"].replace([np.inf, -np.inf], 1.0)
+
+    # 2. LAG FEATURES (Corretto per Driver)
+    # Ordiniamo prima per assicurarci che lo shift sia temporale
+    df = df.sort_values(["session_key", "driver_number", "lap_number"])
+
+    # Usiamo driver_number solo per il calcolo, non serve che sia in LAP_FEATURES
+    df["prev_lap_duration"] = df.groupby(["session_key", "driver_number"])["lap_duration"].shift(1)
+
+    # Riempimento dei primi giri dello stint (dove shift crea NaN)
+    df["prev_lap_duration"] = df.groupby(["session_key", "driver_number"])["prev_lap_duration"].transform(
+        lambda x: x.fillna(x.median())
+    )
+    # Fallback globale se un pilota ha un solo giro
+    df["prev_lap_duration"] = df["prev_lap_duration"].fillna(df["lap_duration"].median())
+
     logger.info(f"  Righe dopo pulizia: {len(df)}")
     logger.info(f"  Sessioni: {df['session_key'].nunique()}")
     logger.info(f"  Circuiti: {df['location'].nunique() if 'location' in df.columns else 'N/A'}")
-    logger.info(f"  Compound distribution:\n{df['compound'].value_counts().to_string()}")
+    logger.info(f"  Compound:\n{df['compound'].value_counts().to_string()}")
+
     return df
 
 
-def _temporal_split(df: pd.DataFrame, test_circuit: str | None = None, test_ratio: float = 0.15):
-    """
-    Divide train/test in modo temporalmente corretto.
-
-    Se test_circuit è specificato (es. "Monza"):
-        train = tutte le gare tranne Monza
-        test  = solo Monza
-    Altrimenti:
-        train = sessioni più vecchie
-        test  = sessioni più recenti
-
-    In entrambi i casi non c'è mai data leakage: il test
-    contiene solo gare che il modello non ha mai visto.
-    """
+def _temporal_split(
+    df: pd.DataFrame, test_circuit: str | None = None, test_ratio: float = 0.1
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     if test_circuit:
-        loc_col = "location" if "location" in df.columns else None
-        if loc_col and df[loc_col].str.lower().str.contains(test_circuit.lower()).any():
-            train_df = df[~df[loc_col].str.lower().str.contains(test_circuit.lower())]
-            test_df = df[df[loc_col].str.lower().str.contains(test_circuit.lower())]
-            logger.info(f"  Split per circuito: train=tutto tranne {test_circuit}, test={test_circuit}")
-            return train_df, test_df
+        for col in ["location", "circuit_short_name"]:
+            if col in df.columns:
+                mask = df[col].str.lower().str.contains(test_circuit.lower(), na=False)
+                if mask.any():
+                    logger.info(f"  Split per circuito '{test_circuit}': train={len(df[~mask])}, test={len(df[mask])}")
+                    return df[~mask], df[mask]
         logger.warning(f"  Circuito '{test_circuit}' non trovato, uso split temporale")
 
-    # Split temporale: ordina sessioni per session_key (proxy dell'ordine cronologico)
     sessions = sorted(df["session_key"].unique())
     n_test = max(1, int(len(sessions) * test_ratio))
     test_sess = sessions[-n_test:]
     train_sess = sessions[:-n_test]
     train_df = df[df["session_key"].isin(train_sess)]
     test_df = df[df["session_key"].isin(test_sess)]
-    logger.info(f"  Split temporale ({test_ratio:.0%}): train={len(train_sess)} sessioni, test={len(test_sess)} sessioni")
+    logger.info(f"  Split temporale: train={len(train_sess)} sess, test={len(test_sess)} sess")
     return train_df, test_df
 
 
-# ── Feature engineering ────────────────────────────────────────────────────────
+# ── Modello 1: LapTimePredictor ────────────────────────────────────────────────
+
 LAP_FEATURES = [
     "compound_enc",
     "stint_lap",
@@ -152,24 +151,35 @@ LAP_FEATURES = [
     "speed_range",
     "humidity",
     "wind_speed",
+    "session_progression",
+    "speed_efficiency",
+    "prev_lap_duration",
+    "avg_energy_session",
 ]
 
 
-def build_lap_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    X = df[LAP_FEATURES].values.astype(np.float32)
-    y = df["lap_duration"].values.astype(np.float32)
-    return X, y
-
-
-# ── Modello 1: LapTimePredictor ────────────────────────────────────────────────
 def train_lap_time_model(df: pd.DataFrame, test_circuit: str | None = None) -> dict:
     logger.info("\n=== Training LapTimePredictor (GradientBoosting) ===")
+
+    # Rimuovi feature con troppi NaN
+    active_features = []
+    for f in LAP_FEATURES:
+        if f in df.columns and df[f].isna().mean() <= 0.3:
+            active_features.append(f)
+        else:
+            logger.warning(f"  Feature '{f}' esclusa (>30% NaN o mancante)")
 
     train_df, test_df = _temporal_split(df, test_circuit)
     logger.info(f"  Train: {len(train_df)} giri  |  Test: {len(test_df)} giri")
 
-    X_train, y_train = build_lap_features(train_df)
-    X_test, y_test = build_lap_features(test_df)
+    nan_counts = train_df[active_features].isna().sum()
+    if nan_counts.any():
+        logger.error(f"NaN trovati nelle feature prima del fit:\n{nan_counts[nan_counts > 0]}")
+
+    X_train = train_df[active_features].values.astype(np.float32)
+    y_train = train_df["lap_duration"].values.astype(np.float32)
+    X_test = test_df[active_features].values.astype(np.float32)
+    y_test = test_df["lap_duration"].values.astype(np.float32)
 
     model = Pipeline(
         [
@@ -187,52 +197,57 @@ def train_lap_time_model(df: pd.DataFrame, test_circuit: str | None = None) -> d
             ),
         ]
     )
-
     model.fit(X_train, y_train)
 
     preds = model.predict(X_test)
     mae = mean_absolute_error(y_test, preds)
     rmse = math.sqrt(mean_squared_error(y_test, preds))
     r2 = model.score(X_test, y_test)
+    cv = -cross_val_score(model, X_train, y_train, cv=5, scoring="neg_mean_absolute_error").mean()
 
-    # Cross-validation solo sul train set (corretto: non tocca il test)
-    cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring="neg_mean_absolute_error")
-    cv_mae = -cv_scores.mean()
-
-    logger.info(f"  MAE  test: {mae:.4f}s")
-    logger.info(f"  RMSE test: {rmse:.4f}s")
-    logger.info(f"  R²   test: {r2:.4f}")
-    logger.info(f"  CV MAE (5-fold, solo train): {cv_mae:.4f}s")
+    logger.info(f"  MAE={mae:.4f}s  RMSE={rmse:.4f}s  R²={r2:.4f}  CV_MAE={cv:.4f}s")
 
     gbr = model.named_steps["gbr"]
-    importance = dict(zip(LAP_FEATURES, gbr.feature_importances_.tolist(), strict=False))
-    logger.info("  Feature importance:")
-    for feat, imp in sorted(importance.items(), key=lambda x: x[1], reverse=True):
-        bar = "█" * int(imp * 40)
-        logger.info(f"    {feat:<16} {imp:.3f}  {bar}")
+    importance = dict(zip(active_features, gbr.feature_importances_.tolist(), strict=False))
+    for feat, imp in sorted(importance.items(), key=lambda x: x[1], reverse=True)[:8]:
+        logger.info(f"    {feat:<30} {imp:.3f}  {'█' * int(imp * 40)}")
 
     path = MODEL_DIR / "lap_time_model.pkl"
     with open(path, "wb") as f:
-        pickle.dump({"model": model, "features": LAP_FEATURES}, f)
+        pickle.dump({"model": model, "features": active_features}, f)
     logger.info(f"  Salvato: {path}")
 
     return {
         "type": "GradientBoostingRegressor",
+        "features": active_features,
         "n_train": len(X_train),
         "n_test": len(X_test),
-        "metrics": {"MAE": round(mae, 4), "RMSE": round(rmse, 4), "R2": round(r2, 4), "CV_MAE": round(cv_mae, 4)},
+        "metrics": {"MAE": round(mae, 4), "RMSE": round(rmse, 4), "R2": round(r2, 4), "CV_MAE": round(cv, 4)},
         "feature_importance": {k: round(v, 4) for k, v in importance.items()},
     }
 
 
-# ── Modello 2: DegradationModel ───────────────────────────────────────────────
+# ── Modello 2: DegradationRiskModel ───────────────────────────────────────────
+# Stima il degrado giro per giro per compound.
+# Permette di calcolare il "rischio degrado" di una strategia:
+# quanti secondi perde uno stint che va oltre il cliff del compound.
+
+DEGR_FEATURES = [
+    "stint_lap",
+    "track_temp",
+    "air_temp",
+    "speed_mean",
+    "lap_number",
+    "session_progression",
+    "weather_enc",
+    "avg_energy_session",
+]
+
+
 def train_degradation_model(df: pd.DataFrame, test_circuit: str | None = None) -> dict:
-    logger.info("\n=== Training DegradationModel (Enhanced Ridge) ===")
+    logger.info("\n=== Training DegradationRiskModel (Ridge polynomial per compound) ===")
 
     train_df, test_df = _temporal_split(df, test_circuit)
-
-    DEGR_FEATURES = ["stint_lap", "track_temp", "speed_mean", "lap_number"]
-
     results = {}
     models = {}
 
@@ -241,16 +256,16 @@ def train_degradation_model(df: pd.DataFrame, test_circuit: str | None = None) -
         sub_test = test_df[test_df["compound"] == compound]
 
         if len(sub_train) < 50:
+            logger.warning(f"  {compound}: dati insufficienti ({len(sub_train)}), skip")
             continue
 
-        # Target = delta rispetto al best pace (5° percentile) della sessione
-        y_train = sub_train["lap_duration_norm"].values.astype(np.float32)
-        X_train = sub_train[DEGR_FEATURES].values.astype(np.float32)
+        avail_features = [f for f in DEGR_FEATURES if f in sub_train.columns and sub_train[f].isna().mean() < 0.3]
 
-        X_test = sub_test[DEGR_FEATURES].values.astype(np.float32) if len(sub_test) > 0 else None
+        X_train = sub_train[avail_features].values.astype(np.float32)
+        y_train = sub_train["lap_duration_norm"].values.astype(np.float32)
+        X_test = sub_test[avail_features].values.astype(np.float32) if len(sub_test) > 0 else None
         y_test = sub_test["lap_duration_norm"].values.astype(np.float32) if len(sub_test) > 0 else None
 
-        # Pipeline con StandardScaler (fondamentale ora che le features hanno scale diverse)
         pipe = Pipeline(
             [
                 ("scaler", StandardScaler()),
@@ -258,123 +273,204 @@ def train_degradation_model(df: pd.DataFrame, test_circuit: str | None = None) -
                 ("ridge", Ridge(alpha=10.0)),
             ]
         )
-
         pipe.fit(X_train, y_train)
 
         test_mae = None
-        if X_test is not None:
-            preds = pipe.predict(X_test)
-            test_mae = round(float(mean_absolute_error(y_test, preds)), 4)
+        if X_test is not None and len(X_test) > 0:
+            y_pred = pipe.predict(X_test)
+            test_mae = round(float(mean_absolute_error(y_test, y_pred)), 4)
 
-        # Salvataggio
+        # --- Calcolo dinamico del Cliff ---
+        # Usiamo i valori mediani del compound per simulare uno stint standard
+        meds = {f: float(sub_train[f].median()) for f in avail_features if f != "stint_lap"}
+        if "weather_enc" in meds:
+            meds["weather_enc"] = 0.0  # Simuliamo su asciutto
+
+        cliff_lap = 54
+        for lap in range(1, 55):
+            row = []
+            for f in avail_features:
+                if f == "stint_lap":
+                    row.append(lap)
+                else:
+                    row.append(meds.get(f, 0.0))
+
+            delta = float(pipe.predict(np.array([row], dtype=np.float32))[0])
+            if delta > 2.0:  # Soglia critica: perdita di 2 secondi rispetto al best
+                cliff_lap = lap
+                break
+
         models[compound] = pipe
-        results[compound] = {"n_train": len(sub_train), "test_mae": test_mae, "features": DEGR_FEATURES}
-
-        mae_str = f" test_MAE={test_mae:.4f}s" if test_mae else ""
-        logger.info(f"  {compound:<14} {len(sub_train)} giri {mae_str}")
+        results[compound] = {
+            "features": avail_features,
+            "cliff_lap": cliff_lap,
+            "n_train": len(sub_train),
+            "n_test": len(sub_test),
+            "test_mae": test_mae,
+            "avg_energy": round(meds.get("avg_energy_session", 0), 2),
+        }
+        mae_str = f"test_MAE={test_mae:.4f}s" if test_mae else "test_MAE=N/A"
+        logger.info(f"  {compound:<14} cliff≈{cliff_lap}giri | n_train={len(sub_train)} | {mae_str}")
 
     path = MODEL_DIR / "degradation_model.pkl"
     with open(path, "wb") as f:
         pickle.dump({"models": models, "metadata": results}, f)
+    logger.info(f"  Salvato: {path}")
 
-    return {"type": "Multi-feature Ridge Polynomial", "compounds": results}
+    return {"type": "Ridge(poly=2) per compound", "compounds": results}
 
 
-# ── Modello 3: CompoundRecommender ────────────────────────────────────────────
-def train_compound_recommender(df: pd.DataFrame, test_circuit: str | None = None) -> dict:
-    logger.info("\n=== Training CompoundRecommender (RandomForest) ===")
+# ── Modello 3: SafetyCarImpactModel ───────────────────────────────────────────
+# Stima quanti secondi guadagna/perde un pit stop in relazione alla Safety Car.
+# Features: distanza pit stop dalla SC, durata SC, compound montato, giro assoluto.
+# Target: delta_time = lap_time_sc_lap - mediana_lap_time_sessione
+#         (negativo = il pilota ha guadagnato rispetto al passo normale)
+#
+# Logica: durante una SC tutti rallentano → chi fa il pit "gratis" guadagna
+# rispetto a chi paga il pit in condizioni normali (22+ secondi di delta).
+# Il modello impara questa relazione dai dati reali.
 
-    group_cols = ["session_key", "driver_number", "compound"]
-    if "location" in df.columns:
-        group_cols.append("location")
 
-    # Aggrega per stint prima di splittare
-    stint_groups = (
-        df.groupby(group_cols)
-        .agg(
-            n_laps=("lap_duration", "count"),
-            weather_enc=("weather_enc", "median"),
-            air_temp=("air_temp", "median"),
-            track_temp=("track_temp", "median"),
-            lap_start=("lap_number", "min"),
-            speed_avg=("speed_mean", "mean"),
-            sec1_deg=("duration_sector_1_norm", "mean"),
-            sec2_deg=("duration_sector_2_norm", "mean"),
-            sec3_deg=("duration_sector_3_norm", "mean"),
+def _build_sc_dataset(df: pd.DataFrame) -> pd.DataFrame | None:
+    """
+    Costruisce il dataset per il SafetyCarImpactModel.
+    Per ogni sessione che ha avuto una SC, calcola:
+      - distanza tra ogni pit stop e il giro SC più vicino
+      - composto montato dopo il pit
+      - vantaggio/svantaggio in secondi rispetto al pit in condizioni normali
+    """
+    # Abbiamo bisogno dei dati raw con SC laps — li ricaviamo da is_sc_lap
+    # ma nel CSV abbiamo già il flag. Usiamo pit_out_lap come proxy del pit stop.
+
+    normal_speed = df[~df["is_sc_lap"]].groupby("session_key")["speed_mean"].median().rename("speed_ref")
+    session_median = df.groupby("session_key")["lap_duration"].median().rename("median_lap")
+
+    sc_first = df[df["is_sc_lap"]].groupby("session_key")["lap_number"].min().rename("sc_lap_number")
+
+    # Calcolo progressivo della durata SC (quanti giri di SC sono passati finora)
+    df = df.sort_values(["session_key", "lap_number"])
+    df["sc_duration_step"] = df.groupby("session_key")["is_sc_lap"].cumsum()
+
+    pit_laps = df[df["is_pit_out_lap"] == True].copy()  # noqa: E712
+    if len(pit_laps) == 0:
+        return None
+
+    pit_laps = pit_laps.merge(normal_speed, on="session_key", how="left")
+    pit_laps = pit_laps.merge(session_median, on="session_key", how="left")  # Mediana del tempo giro per sessione
+    pit_laps = pit_laps.merge(
+        sc_first, on="session_key", how="left"
+    )  # Identifica il giro SC per sessione: primo giro con is_sc_lap=True
+
+    # Rapporto velocità: quanto si va piano rispetto al normale?
+    pit_laps["sc_speed_ratio"] = (pit_laps["speed_mean"] / pit_laps["speed_ref"]).fillna(1.0)
+
+    # Calcolo distanza (gestendo i NaN per le sessioni senza SC)
+    # Distanza pit ↔ SC (negativa = pit PRIMA della SC, positiva = pit DOPO)
+    pit_laps["dist_to_sc"] = pit_laps["lap_number"] - pit_laps["sc_lap_number"]
+    pit_laps["dist_to_sc"] = pit_laps["dist_to_sc"].fillna(999)
+    pit_laps["has_sc"] = pit_laps["sc_lap_number"].notna().astype(int)
+    pit_laps["sc_duration_step"] = pit_laps["sc_duration_step"].fillna(0)
+
+    # Target: delta rispetto al passo normale
+    # Un pit durante SC costa ~0s di delta (il tempo perso nel pit lane è recuperato
+    # perché tutti rallentano); un pit in condizioni normali costa ~22s di delta.
+    # Usiamo la lap_duration_norm (già calcolata) del giro di pit-out come proxy del costo.
+    pit_laps["pit_cost_delta"] = pit_laps["lap_duration_norm"]  # quanto più lento del best pace
+
+    # Features
+    records = []
+    for _, row in pit_laps.iterrows():
+        records.append(
+            {
+                "dist_to_sc": float(row["dist_to_sc"]),
+                "has_sc": int(row["has_sc"]),
+                "sc_speed_ratio": float(row["sc_speed_ratio"]),
+                "sc_duration_step": float(row["sc_duration_step"]),
+                "compound_enc": COMPOUND_ENC.get(str(row["compound"]).lower(), 1),
+                "lap_number": int(row["lap_number"]),
+                "weather_enc": int(row["weather_enc"]),
+                "track_temp": float(row["track_temp"]),
+                "rainfall": float(row.get("rainfall", 0.0)),
+                "pit_cost_delta": float(row["pit_cost_delta"]),
+            }
         )
-        .reset_index()
-    )
 
-    if len(stint_groups) < 50:
-        logger.warning("  Troppo pochi stint aggregati, il recommender potrebbe essere inaccurato")
+    if not records:
+        return None
 
-    # Split temporale sugli stint (stesso criterio degli altri modelli)
-    train_stint, test_stint = _temporal_split(stint_groups, test_circuit)
+    return pd.DataFrame(records).dropna()
 
-    def make_X(sdf):
-        feats = [
-            "n_laps",
-            "weather_enc",
-            "air_temp",
-            "track_temp",
-            "lap_start",
-            "speed_avg",
-            "sec1_deg",
-            "sec2_deg",
-            "sec3_deg",
+
+SC_FEATURES = [
+    "dist_to_sc",
+    "has_sc",
+    "sc_speed_ratio",  # Intensità neutralizzazione (0.4 = Full SC, 0.7 = VSC)
+    "sc_duration_step",  # Da quanto tempo la SC è fuori
+    "compound_enc",
+    "lap_number",
+    "weather_enc",
+    "track_temp",
+    "rainfall",  # Importante per i tempi di reazione del pit
+]
+
+
+def train_sc_impact_model(df: pd.DataFrame, test_circuit: str | None = None) -> dict:
+    logger.info("\n=== Training SafetyCarImpactModel (GradientBoosting) ===")
+
+    train_df, test_df = _temporal_split(df, test_circuit)
+
+    sc_train = _build_sc_dataset(train_df)
+    sc_test = _build_sc_dataset(test_df)
+
+    if sc_train is None or len(sc_train) < 30:
+        logger.warning(f"  Dati SC insufficienti ({len(sc_train) if sc_train is not None else 0} record), skip")
+        path = MODEL_DIR / "sc_impact_model.pkl"
+        with open(path, "wb") as f:
+            pickle.dump({"model": None, "features": SC_FEATURES, "fallback": True}, f)
+        return {"type": "SafetyCarImpactModel", "status": "skipped_insufficient_data"}
+
+    X_train = sc_train[SC_FEATURES].values.astype(np.float32)
+    y_train = sc_train["pit_cost_delta"].values.astype(np.float32)
+
+    model = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "gbr",
+                GradientBoostingRegressor(
+                    n_estimators=800,
+                    max_depth=8,
+                    learning_rate=0.03,
+                    subsample=0.8,
+                    random_state=42,
+                ),
+            ),
         ]
-        X = sdf[feats].values.astype(np.float32)
-        return np.hstack([X, np.sqrt(X[:, 0:1])])
-
-    X_train = make_X(train_stint)
-    X_test = make_X(test_stint)
-
-    le = LabelEncoder()
-    le.fit(stint_groups["compound"].values)
-    y_train = le.transform(train_stint["compound"].values)
-    y_test = le.transform(test_stint["compound"].values)
-
-    model = RandomForestClassifier(
-        n_estimators=500,
-        max_depth=8,
-        min_samples_leaf=5,
-        random_state=42,
-        class_weight="balanced",
     )
     model.fit(X_train, y_train)
 
-    acc = model.score(X_test, y_test)
-    logger.info(f"  Accuracy test: {acc:.3f}  (train={len(X_train)}, test={len(X_test)})")
-    logger.info(f"  Classi: {list(le.classes_)}")
+    test_mae = None
+    if sc_test is not None and len(sc_test) > 0:
+        X_test = sc_test[SC_FEATURES].values.astype(np.float32)
+        y_test = sc_test["pit_cost_delta"].values.astype(np.float32)
+        test_mae = round(float(mean_absolute_error(y_test, model.predict(X_test))), 4)
 
-    feat_names = [
-        "n_laps",
-        "weather_enc",
-        "air_temp",
-        "track_temp",
-        "lap_start",
-        "speed_avg",
-        "sec1_deg",
-        "sec2_deg",
-        "sec3_deg",
-        "sqrt_n_laps",
-    ]
-    importance = dict(zip(feat_names, model.feature_importances_.tolist(), strict=False))
-    logger.info("  Feature importance:")
+    logger.info(f"  n_train={len(sc_train)}  test_MAE={test_mae}s")
+
+    gbr = model.named_steps["gbr"]
+    importance = dict(zip(SC_FEATURES, gbr.feature_importances_.tolist(), strict=False))
     for feat, imp in sorted(importance.items(), key=lambda x: x[1], reverse=True):
-        logger.info(f"    {feat:<16} {imp:.3f}")
+        logger.info(f"    {feat:<20} {imp:.3f}  {'█' * int(imp * 30)}")
 
-    path = MODEL_DIR / "compound_recommender.pkl"
+    path = MODEL_DIR / "sc_impact_model.pkl"
     with open(path, "wb") as f:
-        pickle.dump({"model": model, "label_encoder": le, "features": feat_names}, f)
+        pickle.dump({"model": model, "features": SC_FEATURES, "fallback": False}, f)
     logger.info(f"  Salvato: {path}")
 
     return {
-        "type": "RandomForestClassifier",
-        "n_train": len(X_train),
-        "n_test": len(X_test),
-        "accuracy_test": round(acc, 4),
-        "classes": list(le.classes_),
+        "type": "GradientBoostingRegressor (pit cost vs SC timing)",
+        "n_train": len(sc_train),
+        "test_mae": test_mae,
         "feature_importance": {k: round(v, 4) for k, v in importance.items()},
     }
 
@@ -387,7 +483,6 @@ def save_training_report(reports: dict, df: pd.DataFrame):
             "sessions": int(df["session_key"].nunique()),
             "circuits": df["location"].nunique() if "location" in df.columns else None,
             "compound_distribution": df["compound"].value_counts().to_dict(),
-            "weather_distribution": df["weather_enc"].value_counts().to_dict(),
             "lap_time_stats": {
                 "mean": round(df["lap_duration"].mean(), 3),
                 "std": round(df["lap_duration"].std(), 3),
@@ -404,6 +499,8 @@ def save_training_report(reports: dict, df: pd.DataFrame):
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
+
+
 def run(csv_path: Path | None = None, test_circuit: str | None = None):
     if csv_path is None:
         csv_path = DATA_DIR / "all_circuits_laps.csv"
@@ -413,37 +510,26 @@ def run(csv_path: Path | None = None, test_circuit: str | None = None):
         return None
 
     df = load_and_clean(csv_path)
-
+    df_raw = load_and_clean(csv_path, erase_stop_sc=False)
     if len(df) < 100:
-        logger.error(f"Dataset troppo piccolo ({len(df)} giri). Scarica più dati.")
+        logger.error("Dataset troppo piccolo.")
         return None
 
-    reports = {}
-    reports["lap_time_model"] = train_lap_time_model(df, test_circuit)
-    reports["degradation_model"] = train_degradation_model(df, test_circuit)
-    reports["compound_recommender"] = train_compound_recommender(df, test_circuit)
-
-    report = save_training_report(reports, df)
-
-    logger.info("\n=== Training completato ===")
-    logger.info(f"Modelli salvati in: {MODEL_DIR}/")
-    logger.info("Prossimo step: python src/f1_strategy/main.py")
-
-    return report
+    reports = {
+        # "lap_time_model": train_lap_time_model(df, test_circuit),
+        "degradation_model": train_degradation_model(df, test_circuit),
+        "sc_impact_model": train_sc_impact_model(df_raw, test_circuit),
+    }
+    save_training_report(reports, df)
+    logger.info("\n=== Training completato. Modelli in: models/ ===")
+    return reports
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Addestra modelli ML su dati reali OpenF1")
-    parser.add_argument("--data", type=str, default=None, help="Path al CSV")
-    parser.add_argument(
-        "--test-circuit",
-        type=str,
-        default=None,
-        help="Circuito da usare come test set (es. 'Monza'). Default: split temporale.",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=str, default=None)
+    parser.add_argument("--test-circuit", type=str, default=None)
     args = parser.parse_args()
-
-    run(
-        csv_path=Path(args.data) if args.data else None,
-        test_circuit=args.test_circuit,
-    )
+    if args.test_circuit is None:
+        logger.info("NO TEST CIRCUIT: uso split temporale invece di un circuito dedicato")
+    run(csv_path=Path(args.data) if args.data else None, test_circuit=args.test_circuit)

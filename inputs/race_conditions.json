@@ -1,0 +1,17 @@
+{
+  "circuit": "Monza",
+  "total_laps": 53,
+  "weather": {
+    "type": "variable",
+    "description": "Asciutto fino al giro 30, poi pioggia pesante fino a fine gara",
+    "rain_start_lap": 30,
+    "rain_intensity": "heavy"
+  },
+  "safety_car": {
+    "active": true,
+    "lap": 32,
+    "duration_laps": 3
+  },
+  "grid_position": 6,
+  "pit_lane_time_loss_seconds": 23.5
+}
