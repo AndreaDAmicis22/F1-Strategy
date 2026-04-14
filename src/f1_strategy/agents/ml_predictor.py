@@ -46,8 +46,6 @@ def _load_pickle(filename: str) -> dict:
 
 
 # ── LapTimePredictor ──────────────────────────────────────────────────────────
-
-
 class LapTimePredictor:
     """GBR che predice il tempo giro dato compound, stint_lap, meteo, temperatura."""
 
@@ -65,10 +63,12 @@ class LapTimePredictor:
         track_temp: float = 38.0,
         air_temp: float = 25.0,
         lap_number: int = 1,
+        max_session_laps: int = 55,
+        prev_lap_duration: float = 90.0,
         **kwargs,
     ) -> float:
         """Predice il tempo giro. kwargs accetta feature extra (speed_mean, ecc.)."""
-        defaults = {
+        data = {
             "compound_enc": COMPOUND_ENC.get(compound.lower(), 1),
             "stint_lap": stint_lap,
             "stint_lap_sq": stint_lap**2,
@@ -76,16 +76,32 @@ class LapTimePredictor:
             "air_temp": air_temp,
             "track_temp": track_temp,
             "lap_number": lap_number,
-            "duration_sector_1_norm": kwargs.get("sec1_norm", 0.0),
-            "duration_sector_2_norm": kwargs.get("sec2_norm", 0.0),
-            "duration_sector_3_norm": kwargs.get("sec3_norm", 0.0),
-            "speed_mean": kwargs.get("speed_mean", 210.0),
-            "speed_range": kwargs.get("speed_range", 50.0),
             "humidity": kwargs.get("humidity", 50.0),
             "wind_speed": kwargs.get("wind_speed", 5.0),
         }
-        X = np.array([[defaults[f] for f in self.features]], dtype=np.float32)
-        return float(self.model.predict(X)[0])
+
+        # 2. Settori e Velocità (Normalizzati o medi)
+        data.update(
+            {
+                "duration_sector_1_norm": kwargs.get("sec1_norm", 0.1),
+                "duration_sector_2_norm": kwargs.get("sec2_norm", 0.1),
+                "duration_sector_3_norm": kwargs.get("sec3_norm", 0.1),
+                "speed_mean": kwargs.get("speed_mean", 210.0),
+                "speed_range": kwargs.get("speed_range", 50.0),
+            }
+        )
+
+        data["session_progression"] = lap_number / max_session_laps
+        data["speed_efficiency"] = kwargs.get("speed_efficiency", 1.0)
+        data["prev_lap_duration"] = prev_lap_duration
+        data["avg_energy_session"] = kwargs.get("avg_energy_session", (data["speed_mean"] * track_temp))
+
+        try:
+            X = np.array([[data[f] for f in self.features]], dtype=np.float32)
+            return float(self.model.predict(X)[0])
+        except KeyError as e:
+            logger.exception(f"Feature richiesta dal modello ma non calcolata nel predictor: {e}")
+            raise
 
     def evaluate(self) -> dict:
         report_path = MODEL_DIR / "training_report.json"
@@ -125,40 +141,64 @@ class DegradationRiskModel:
         return self.metadata.get(compound.lower(), {}).get("cliff_lap", 30)
 
     def predict_delta(
-        self, compound: str, stint_lap: int, track_temp: float = 38.0, speed_mean: float = 210.0, lap_number: int = 27
+        self,
+        compound: str,
+        stint_lap: int,
+        track_temp: float = 38.0,
+        air_temp: float = 25.0,
+        speed_mean: float = 210.0,
+        lap_number: int = 27,
+        total_session_laps: int = 55,
+        weather: int = 0,
+        **kwargs,
     ) -> float:
-        """Secondi extra rispetto al best pace al giro stint_lap dello stint."""
+        """
+        Calcola i secondi extra rispetto al best pace dovuti al degrado.
+        """
         compound = compound.lower()
         if compound not in self.models:
             return 0.0
+
         features = self.metadata[compound].get("features", ["stint_lap"])
-        row = []
-        for f in features:
-            if f == "stint_lap":
-                row.append(stint_lap)
-            elif f == "track_temp":
-                row.append(track_temp)
-            elif f == "speed_mean":
-                row.append(speed_mean)
-            elif f == "lap_number":
-                row.append(lap_number)
+
+        # Dizionario per mappare i valori correnti alle feature attive nel modello
+        data_map = {
+            "stint_lap": stint_lap,
+            "track_temp": track_temp,
+            "air_temp": air_temp,
+            "speed_mean": speed_mean,
+            "lap_number": lap_number,
+            "session_progression": lap_number / total_session_laps,
+            "weather_enc": weather,
+            "avg_energy_session": kwargs.get("avg_energy_session", (speed_mean * track_temp)),
+        }
+
+        # Costruiamo la riga di input nell'ordine corretto salvato nei metadati
+        row = [data_map.get(f, 0.0) for f in features]
+
         X = np.array([row], dtype=np.float32)
+        # Il degrado non può essere negativo (la gomma non rigenera tempo)
         return max(0.0, float(self.models[compound].predict(X)[0]))
 
-    def assess_stint_risk(self, compound: str, stint_length: int, track_temp: float = 38.0) -> dict:
+    def assess_stint_risk(self, compound: str, stint_length: int, track_temp: float = 38.0, **kwargs) -> dict:
         """
-        Valuta il rischio degrado di uno stint.
-        Ritorna: delta_total, exceeds_cliff, penalty_seconds.
+        Valuta il rischio degrado di uno stint completo.
         """
         cliff = self.get_cliff(compound)
-        total_deg = sum(self.predict_delta(compound, lap, track_temp) for lap in range(1, stint_length + 1))
+
+        # Somma del degrado giro per giro
+        total_deg = sum(
+            self.predict_delta(compound, lap, track_temp=track_temp, **kwargs) for lap in range(1, stint_length + 1)
+        )
+
         exceeds = stint_length > cliff
         penalty = 0.0
+
         if exceeds:
-            # Ogni giro oltre il cliff vale il doppio del degrado stimato
+            # Calcolo della penalità: media del degrado nei giri oltre il cliff
             extra_laps = stint_length - cliff
             penalty = sum(
-                self.predict_delta(compound, cliff + l, track_temp) * extra_laps for l in range(1, extra_laps + 1)
+                self.predict_delta(compound, cliff + l, track_temp=track_temp, **kwargs) for l in range(1, extra_laps + 1)
             ) / max(extra_laps, 1)
 
         return {
@@ -168,13 +208,11 @@ class DegradationRiskModel:
             "total_degradation_seconds": round(total_deg, 2),
             "exceeds_cliff": exceeds,
             "penalty_seconds": round(penalty, 2),
-            "risk_level": "HIGH" if exceeds and penalty > 5 else ("MEDIUM" if exceeds else "LOW"),
+            "risk_level": "HIGH" if exceeds and penalty > 4 else ("MEDIUM" if exceeds else "LOW"),
         }
 
 
 # ── SafetyCarImpactModel ──────────────────────────────────────────────────────
-
-
 class SafetyCarImpactModel:
     """
     GBR che stima il costo effettivo di un pit stop in relazione alla Safety Car.
@@ -200,70 +238,82 @@ class SafetyCarImpactModel:
         weather: str = "dry",
         track_temp: float = 38.0,
         pit_lane_seconds: float = NORMAL_PIT_COST_SECONDS,
+        **kwargs,
     ) -> float:
         """
         Stima il costo effettivo di un pit stop in secondi.
-        Durante SC il costo è quasi 0 perché tutti rallentano.
         """
+        # 1. Fallback se il modello non è stato addestrato
         if self.model is None or self.fallback:
-            # Fallback analitico: se il pit è entro 2 giri dalla SC, costo ≈ 0
             if sc_lap is not None and abs(pit_lap - sc_lap) <= 2:
-                return 0.0
+                return 12.0  # Costo medio stimato sotto SC reale
             return pit_lane_seconds
 
-        dist = (pit_lap - sc_lap) if sc_lap is not None else 999
-        has_sc = 1 if sc_lap is not None else 0
-        row = []
-        for f in self.features:
-            if f == "dist_to_sc":
-                row.append(dist)
-            elif f == "has_sc":
-                row.append(has_sc)
-            elif f == "compound_enc":
-                row.append(COMPOUND_ENC.get(compound.lower(), 1))
-            elif f == "lap_number":
-                row.append(pit_lap)
-            elif f == "weather_enc":
-                row.append(WEATHER_ENC.get(weather, 0))
-            elif f == "track_temp":
-                row.append(track_temp)
-        X = np.array([row], dtype=np.float32)
-        return max(0.0, float(self.model.predict(X)[0]))
+        # 2. Preparazione dati (Mapping delle nuove features)
+        sc_active = sc_lap is not None
+        dist = (pit_lap - sc_lap) if sc_active else 999
+
+        # sc_speed_ratio: 0.4 per Full SC, 0.7 per VSC, 1.0 per Green Flag
+        sc_speed_ratio = kwargs.get("sc_speed_ratio")
+        if sc_speed_ratio is None:
+            sc_speed_ratio = 0.4 if sc_active else 1.0
+
+        data_map = {
+            "dist_to_sc": dist,
+            "has_sc": 1 if sc_active else 0,
+            "sc_speed_ratio": sc_speed_ratio,
+            "sc_duration_step": kwargs.get("sc_duration_step", (dist if sc_active and dist > 0 else 0)),
+            "compound_enc": COMPOUND_ENC.get(compound.lower(), 1),
+            "lap_number": pit_lap,
+            "weather_enc": WEATHER_ENC.get(weather, 0),
+            "track_temp": track_temp,
+            "rainfall": kwargs.get("rainfall", 0.0),
+        }
+
+        # 3. Prediction
+        try:
+            row = [data_map.get(f, 0.0) for f in self.features]
+            X = np.array([row], dtype=np.float32)
+            # Il costo predetto è il tempo extra rispetto al giro ideale
+            return max(0.0, float(self.model.predict(X)[0]))
+        except Exception as e:
+            logger.warning(f"Errore prediction SC: {e}. Uso fallback.")
+            return pit_lane_seconds if not sc_active else 12.0
 
     def evaluate_strategy_sc_timing(self, strategy: list, conditions: dict) -> dict:
         """
-        Per ogni pit stop nella strategia, valuta quanto è ben sincronizzato con la SC.
+        Valuta il guadagno tattico dei pit stop pianificati in caso di SC.
         """
         sc_active = conditions.get("safety_car", {}).get("active", False)
         sc_lap = conditions.get("safety_car", {}).get("lap") if sc_active else None
-        pit_lane = conditions.get("pit_lane_time_loss_seconds", NORMAL_PIT_COST_SECONDS)
-        weather = "dry"
+        pit_lane_base = conditions.get("pit_lane_time_loss_seconds", NORMAL_PIT_COST_SECONDS)
+
+        # Parametri dinamici per la SC
+        sc_params = {
+            "sc_speed_ratio": conditions.get("safety_car", {}).get("speed_ratio", 0.4 if sc_active else 1.0),
+            "rainfall": conditions.get("weather", {}).get("rainfall", 0.0),
+            "sc_duration_step": conditions.get("safety_car", {}).get("duration_step", 0),
+        }
 
         pit_stops = []
-        sorted_strat = sorted(strategy, key=lambda x: x["start_lap"])
-        for stint in sorted_strat[1:]:  # primo stint non ha pit
+        for stint in strategy[1:]:
             pit_lap = stint["start_lap"]
-            compound = stint["compound"]
-            cost = self.predict_pit_cost(pit_lap, sc_lap, compound, weather, pit_lane_seconds=pit_lane)
-            saving = max(0.0, pit_lane - cost)
-            sc_dist = abs(pit_lap - sc_lap) if sc_lap is not None else None
+            cost = self.predict_pit_cost(pit_lap, sc_lap, stint["compound"], pit_lane_seconds=pit_lane_base, **sc_params)
+            saving = max(0.0, pit_lane_base - cost)
 
             pit_stops.append(
                 {
                     "pit_lap": pit_lap,
-                    "compound_after": compound,
                     "estimated_cost": round(cost, 2),
                     "sc_saving": round(saving, 2),
-                    "sc_distance": sc_dist,
-                    "timing_quality": ("EXCELLENT" if saving > 15 else "GOOD" if saving > 5 else "NEUTRAL"),
+                    "timing_quality": "EXCELLENT" if saving > 12 else "GOOD" if saving > 5 else "NEUTRAL",
                 }
             )
 
-        total_saving = sum(p["sc_saving"] for p in pit_stops)
         return {
             "pit_stops": pit_stops,
-            "total_sc_saving_seconds": round(total_saving, 2),
-            "sc_lap": sc_lap,
+            "total_sc_saving_seconds": round(sum(p["sc_saving"] for p in pit_stops), 2),
+            "sc_active": sc_active,
         }
 
 
@@ -288,14 +338,22 @@ class StrategyEvaluator:
     def evaluate_strategy(self, strategy: list, conditions: dict, track_temp: float = 38.0, air_temp: float = 25.0) -> dict:
         """Simula giro per giro con ML e ritorna tempo totale + lap results."""
         total_laps = conditions.get("total_laps", 53)
-        pit_lane = conditions.get("pit_lane_time_loss_seconds", NORMAL_PIT_COST_SECONDS)
+        pit_lane_base = conditions.get("pit_lane_time_loss_seconds", NORMAL_PIT_COST_SECONDS)
+
+        # Info Safety Car
         sc_info = conditions.get("safety_car", {})
         sc_active = sc_info.get("active", False)
-        sc_lap = sc_info.get("lap", -1)
+        sc_lap_trigger = sc_info.get("lap", -1)
         sc_duration = sc_info.get("duration_laps", 0)
-        rain_start = conditions.get("weather", {}).get("rain_start_lap", 999)
-        rain_intens = conditions.get("weather", {}).get("rain_intensity", "none")
+        sc_speed_ratio = sc_info.get("speed_ratio", 0.4)  # Intensità neutralizzazione
 
+        # Info Meteo
+        weather_info = conditions.get("weather", {})
+        rain_start = weather_info.get("rain_start_lap", 999)
+        rain_intens = weather_info.get("rain_intensity", "none")
+        rainfall = weather_info.get("rainfall", 0.0)
+
+        # Pre-processamento stint
         sorted_strat = sorted(strategy, key=lambda x: x["start_lap"])
         stints_ext = []
         for i, s in enumerate(sorted_strat):
@@ -307,36 +365,69 @@ class StrategyEvaluator:
             for lap in range(st["start_lap"], st["end_lap"] + 1):
                 lap_to_stint[lap] = st
 
+        # --- Variabili di Stato della Simulazione ---
         total_time = 0.0
         lap_results = []
         pit_stops = 0
-        per_compound = {}
+        current_prev_lap_time = 92.0  # Valore di fallback per il giro 1
+        sc_current_step = 0
 
         for lap in range(1, total_laps + 1):
             stint = lap_to_stint.get(lap)
             if not stint:
-                total_time += 90.0
                 continue
 
             compound = stint["compound"]
             stint_lap = lap - stint["start_lap"]
             weather = ("heavy_rain" if rain_intens == "heavy" else "light_rain") if lap >= rain_start else "dry"
-            is_sc = sc_active and sc_lap <= lap < sc_lap + sc_duration
 
-            lap_time = 108.0 if is_sc else self.lap_model.predict(compound, stint_lap, weather, track_temp, air_temp, lap)
+            # Gestione Safety Car
+            is_sc = sc_active and sc_lap_trigger <= lap < sc_lap_trigger + sc_duration
+            if is_sc:
+                sc_current_step += 1
+            else:
+                sc_current_step = 0
 
+            # 1. Calcolo del PIT COST (se è un giro di sosta)
             is_pit = lap == stint["start_lap"] and lap > 1
+            pit_cost = 0.0
             if is_pit:
-                # Costo pit stimato dal SafetyCarImpactModel
-                sc_lap_val = sc_lap if sc_active else None
-                pit_cost = self.sc_model.predict_pit_cost(lap, sc_lap_val, compound, weather, track_temp, pit_lane)
+                sc_lap_val = sc_lap_trigger if sc_active else None
+                pit_cost = self.sc_model.predict_pit_cost(
+                    pit_lap=lap,
+                    sc_lap=sc_lap_val,
+                    compound=compound,
+                    weather=weather,
+                    track_temp=track_temp,
+                    pit_lane_seconds=pit_lane_base,
+                    sc_speed_ratio=sc_speed_ratio if is_sc else 1.0,
+                    sc_duration_step=sc_current_step,
+                    rainfall=rainfall if lap >= rain_start else 0.0,
+                )
                 total_time += pit_cost
                 pit_stops += 1
-            else:
-                pit_cost = 0.0
 
+            # 2. Predizione LAP TIME
+            if is_sc:
+                # Sotto SC il tempo è dettato dalla direzione gara (es. 140% del tempo normale)
+                lap_time = current_prev_lap_time / sc_speed_ratio if sc_speed_ratio > 0 else 140.0
+            else:
+                lap_time = self.lap_model.predict(
+                    compound=compound,
+                    stint_lap=stint_lap,
+                    weather=weather,
+                    track_temp=track_temp,
+                    air_temp=air_temp,
+                    lap_number=lap,
+                    max_session_laps=total_laps,
+                    prev_lap_duration=current_prev_lap_time,
+                    humidity=conditions.get("weather", {}).get("humidity", 50.0),
+                )
+
+            # Aggiornamento stato per il giro successivo
+            current_prev_lap_time = lap_time
             total_time += lap_time
-            per_compound[compound] = per_compound.get(compound, 0.0) + lap_time
+
             lap_results.append(
                 {
                     "lap": lap,
@@ -347,19 +438,15 @@ class StrategyEvaluator:
                     "is_pit_lap": is_pit,
                     "is_sc_lap": is_sc,
                     "pit_cost": round(pit_cost, 2) if is_pit else 0.0,
+                    "cumulative_time": round(total_time, 3),
                 }
             )
 
         return {
-            "strategy": strategy,
-            "total_time": round(total_time, 2),
+            "total_time": round(total_time, 3),
             "pit_stops": pit_stops,
             "lap_results": lap_results,
-            "breakdown": {
-                "time_by_compound": {k: round(v, 2) for k, v in per_compound.items()},
-                "total_pit_time": round(sum(lr["pit_cost"] for lr in lap_results if lr["is_pit_lap"]), 2),
-                "sc_laps": sum(1 for lr in lap_results if lr["is_sc_lap"]),
-            },
+            "strategy_summary": stints_ext,
         }
 
     def get_models_info(self) -> dict:

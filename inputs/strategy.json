@@ -8,8 +8,8 @@
     },
     {
       "stint": 2,
-      "compound": "hard",
-      "start_lap": 26
+      "compound": "wet",
+      "start_lap": 32
     }
   ],
   "rationale": "Strategia 1 pit stop (MEDIUM → HARD), stimato 4585s di gara totale. Pit stop al giro 26 nella finestra strategica ottimale per Monza. Partenza su Medium per bilanciare performance iniziale e stint lungo. Safety Car al giro 15 sfruttata strategicamente per ridurre il costo del pit stop al minimo. Partenza dalla posizione 6: strategia differenziata per gain tramite undercut. Confermato dai dati storici OpenF1: Monza favorisce strategia 1-stop per il basso degrado gomme su asfalto ad alta velocità.",

@@ -25,7 +25,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "agents"))
 
-import agents.data_analysis_agent as data_agent
 from agents.ml_predictor import ModelNotTrainedError, StrategyEvaluator, StrategyValidator
 
 logging.basicConfig(
@@ -131,7 +130,7 @@ def run_pipeline(
     logger.info(f"Strategie da valutare: {len(strategies)}")
 
     # ── Carica modelli ML ──────────────────────────────────────────────────
-    logger.info("\n[ML] Caricamento modelli ML...")
+    logger.info("\n[ML][1/3] Caricamento modelli ML...")
     try:
         evaluator = StrategyEvaluator.load()
         ml_info = evaluator.get_models_info()
@@ -147,14 +146,6 @@ def run_pipeline(
     except Exception as e:
         logger.exception(f"Errore caricamento ML: {e}")
         sys.exit(1)
-
-    # ── Analisi dati storici (opzionale, per contesto) ─────────────────────
-    logger.info("\n[1/3] Analisi dati storici OpenF1...")
-    try:
-        historical = _historical_fallback(circuit) if skip_api else data_agent.run_analysis(circuit)
-    except Exception as e:
-        logger.warning(f"Analisi storica fallita: {e}. Uso fallback.")
-        historical = _historical_fallback(circuit)
 
     # ── Validazione e ranking ──────────────────────────────────────────────
     logger.info("\n[2/3] Validazione e ranking strategie con ML...")
@@ -189,7 +180,7 @@ def run_pipeline(
     # Report HTML
     html = _generate_ranking_html(ranking, conditions)
     html_path = output_dir / "ranking_report.html"
-    html_path.write_text(html)
+    html_path.write_text(html, encoding="utf-8")
     logger.info(f"  ✓ ranking_report.html → {html_path}")
 
     elapsed = time.time() - start_time
@@ -218,7 +209,6 @@ def run_pipeline(
 
     return {
         "ranking": ranking,
-        "historical": historical,
         "ml_info": ml_info,
         "elapsed": elapsed,
     }
