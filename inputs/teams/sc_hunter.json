@@ -1,0 +1,9 @@
+{
+  "team_name": "Safety-Opportunist",
+  "strategy": [
+    { "stint": 1, "compound": "hard", "start_lap": 1 },
+    { "stint": 2, "compound": "medium", "start_lap": 32 }
+  ],
+  "rationale": "Partenza su Hard per restare in pista il più a lungo possibile. Si cerca il 'pit gratis' sotto Safety Car. La velocità finale su Medium sarà molto alta causa basso carburante.",
+  "estimated_total_time_seconds": 4598.10
+}

@@ -1,0 +1,9 @@
+{
+  "team_name": "Standard-Master",
+  "strategy": [
+    { "stint": 1, "compound": "medium", "start_lap": 1 },
+    { "stint": 2, "compound": "hard", "start_lap": 26 }
+  ],
+  "rationale": "Strategia classica 1-stop. Il pit al giro 26 massimizza la vita utile della Medium senza cadere nel cliff. La Hard garantisce stabilità termica nella seconda metà di gara.",
+  "estimated_total_time_seconds": 4584.20
+}

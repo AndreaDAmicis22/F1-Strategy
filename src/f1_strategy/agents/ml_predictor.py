@@ -428,6 +428,14 @@ class StrategyEvaluator:
             current_prev_lap_time = lap_time
             total_time += lap_time
 
+            is_slick = compound.lower() in {"soft", "medium", "hard"}
+            if weather == "light_rain" and is_slick:
+                lap_time += 7.0  # Penalità fissa per pioggia leggera
+            elif weather == "heavy_rain" and is_slick:
+                lap_time += 20.0  # Penalità pesante (quasi impraticabile)
+            elif weather == "dry" and compound.lower() in {"intermediate", "wet"}:
+                lap_time += 5.0  # Le gomme da pioggia si surriscaldano su asciutto
+
             lap_results.append(
                 {
                     "lap": lap,
@@ -477,34 +485,159 @@ class StrategyEvaluator:
 class StrategyValidator:
     """
     Valida e assegna un punteggio a una strategy.json esterna.
-    Produce un report strutturato con:
-      - tempo totale stimato (ML)
-      - rischio degrado per ogni stint
-      - qualità timing pit stop rispetto a SC
-      - punteggio composito (0–100)
-      - lista warning/issues
+
+    Il punteggio composito (0–100) si compone di:
+      - 50% tempo totale ML
+      - 25% rischio degrado
+      - 15% sincronizzazione SC
+      - 10% correttezza formato
+
+    PRIMA del calcolo ML vengono applicati i constraint fisici F1:
+    violazioni gravi (slick su pioggia pesante, wet su asciutto, ecc.)
+    abbattono il punteggio in modo proporzionale alla gravità,
+    indipendentemente dal tempo stimato dal modello.
     """
 
-    # Pesi del punteggio composito
-    W_TIME = 0.50  # 50% — tempo totale (quanto è veloce)
-    W_DEGR = 0.25  # 25% — rischio degrado (stint troppo lunghi)
-    W_SC = 0.15  # 15% — sincronizzazione SC
-    W_FORMAT = 0.10  # 10% — correttezza formato
+    W_TIME = 0.50
+    W_DEGR = 0.25
+    W_SC = 0.15
+    W_FORMAT = 0.10
+
+    # Compound considerati "slick" (non adatti alla pioggia)
+    SLICK_COMPOUNDS = {"soft", "medium", "hard"}
+    # Compound adatti alla pioggia leggera
+    WET_COMPOUNDS = {"intermediate", "wet"}
 
     def __init__(self, evaluator: StrategyEvaluator):
         self.evaluator = evaluator
 
-    def validate(self, strategy_json: dict, conditions: dict, reference_time: float | None = None) -> dict:
-        """
-        Valida una strategy.json e ritorna il report completo.
+    # ── Constraint fisici ──────────────────────────────────────────────────────
 
-        Args:
-            strategy_json:  dict con "team_name", "strategy", "rationale"
-            conditions:     race_conditions.json
-            reference_time: tempo di riferimento per il punteggio relativo
-                            (es. miglior tempo tra tutti i team).
-                            Se None usa il tempo stimato come riferimento.
+    def _check_weather_constraints(self, strategy: list, conditions: dict) -> tuple[list[str], list[str], float]:
         """
+        Verifica che i compound siano compatibili con le condizioni meteo
+        per ogni giro della strategia.
+
+        Regole F1:
+          - Pioggia PESANTE + slick  → ILLEGALE / pericoloso (penalità -60)
+          - Pioggia LEGGERA + slick  → subottimale ma legale  (penalità -20)
+          - Asciutto + wet           → inutilizzabili          (penalità -30)
+          - Asciutto + intermediate  → molto lenti             (penalità -15)
+          - Pioggia PESANTE senza wet → fortemente sconsigliato (penalità -40)
+
+        Ritorna (issues, warnings, weather_penalty).
+        """
+        issues = []
+        warnings = []
+        penalty = 0.0
+
+        rain_start = conditions.get("weather", {}).get("rain_start_lap", 999)
+        rain_intensity = conditions.get("weather", {}).get("rain_intensity", "none")
+        total_laps = conditions.get("total_laps", 53)
+
+        sorted_strat = sorted(strategy, key=lambda x: x.get("start_lap", 0))
+
+        for i, s in enumerate(sorted_strat):
+            compound = s.get("compound", "").lower()
+            start_lap = s.get("start_lap", 1)
+            end_lap = sorted_strat[i + 1]["start_lap"] - 1 if i + 1 < len(sorted_strat) else total_laps
+
+            # Giri di questo stint in fase di pioggia
+            rain_laps_in_stint = max(0, end_lap - max(start_lap, rain_start) + 1) if rain_start <= end_lap else 0
+            dry_laps_in_stint = max(0, min(end_lap, rain_start - 1) - start_lap + 1)
+            total_stint = end_lap - start_lap + 1
+
+            # ── Caso 1: Slick su pioggia pesante ──────────────────────────
+            if rain_intensity == "heavy" and compound in self.SLICK_COMPOUNDS and rain_laps_in_stint > 0:
+                msg = (
+                    f"Stint {i + 1} ({compound.upper()}, G.{start_lap}–{end_lap}): "
+                    f"GOMME SLICK CON PIOGGIA PESANTE per {rain_laps_in_stint} giri — "
+                    f"pericoloso e illegale. Necessarie WET."
+                )
+                issues.append(msg)
+                penalty += 60.0
+
+            # ── Caso 2: Slick su pioggia leggera ──────────────────────────
+            elif rain_intensity in ("light", "moderate") and compound in self.SLICK_COMPOUNDS and rain_laps_in_stint > 0:
+                # Non illegale ma fortemente subottimale
+                frac = rain_laps_in_stint / max(total_stint, 1)
+                p = 20.0 * frac
+                penalty += p
+                warnings.append(
+                    f"Stint {i + 1} ({compound.upper()}): {rain_laps_in_stint} giri su pioggia leggera "
+                    f"con slick — intermedie sarebbero più rapide (~3-5s/giro più lente)"
+                )
+
+            # ── Caso 3: Pioggia pesante senza wet ─────────────────────────
+            elif rain_intensity == "heavy" and compound == "intermediate" and rain_laps_in_stint > 0:
+                frac = rain_laps_in_stint / max(total_stint, 1)
+                p = 40.0 * frac
+                penalty += p
+                warnings.append(
+                    f"Stint {i + 1} (INTERMEDIATE): {rain_laps_in_stint} giri con pioggia PESANTE — "
+                    f"le WET sarebbero obbligatorie/molto più veloci"
+                )
+
+            # ── Caso 4: Wet su asciutto ────────────────────────────────────
+            elif compound == "wet" and dry_laps_in_stint > 0:
+                frac = dry_laps_in_stint / max(total_stint, 1)
+                p = 30.0 * frac
+                penalty += p
+                warnings.append(
+                    f"Stint {i + 1} (WET): {dry_laps_in_stint} giri su asciutto con gomme da pioggia — "
+                    f"inutilizzabili su asciutto (~8s/giro più lente)"
+                )
+
+            # ── Caso 5: Intermediate su asciutto ──────────────────────────
+            elif compound == "intermediate" and dry_laps_in_stint > 0:
+                frac = dry_laps_in_stint / max(total_stint, 1)
+                p = 15.0 * frac
+                penalty += p
+                warnings.append(
+                    f"Stint {i + 1} (INTERMEDIATE): {dry_laps_in_stint} giri su asciutto — ~2s/giro più lento degli slick"
+                )
+
+        return issues, warnings, penalty
+
+    def _check_rain_coverage(self, strategy: list, conditions: dict) -> tuple[list[str], float]:
+        """
+        Verifica che la strategia preveda un compound da pioggia
+        per tutta la fase di pioggia dichiarata nelle condizioni.
+        Se la pioggia è prevista e nessuno stint la copre con wet/intermediate,
+        è un errore strategico grave.
+        """
+        rain_start = conditions.get("weather", {}).get("rain_start_lap", 999)
+        rain_intensity = conditions.get("weather", {}).get("rain_intensity", "none")
+        total_laps = conditions.get("total_laps", 53)
+
+        if rain_intensity == "none" or rain_start >= total_laps:
+            return [], 0.0
+
+        # Cerca se esiste almeno uno stint wet/intermediate che copre il rain_start
+        sorted_strat = sorted(strategy, key=lambda x: x.get("start_lap", 0))
+        rain_covered = False
+        for i, s in enumerate(sorted_strat):
+            compound = s.get("compound", "").lower()
+            start_lap = s.get("start_lap", 1)
+            end_lap = sorted_strat[i + 1]["start_lap"] - 1 if i + 1 < len(sorted_strat) else total_laps
+            if compound in self.WET_COMPOUNDS and start_lap <= rain_start + 3 and end_lap >= rain_start:
+                rain_covered = True
+                break
+
+        if not rain_covered:
+            severity = "PESANTE" if rain_intensity == "heavy" else "LEGGERA"
+            msg = (
+                f"Nessun compound da pioggia (intermediate/wet) previsto "
+                f"per la fase di pioggia {severity} (dal giro {rain_start})"
+            )
+            penalty = 35.0 if rain_intensity == "heavy" else 15.0
+            return [msg], penalty
+
+        return [], 0.0
+
+    # ── validate ──────────────────────────────────────────────────────────────
+
+    def validate(self, strategy_json: dict, conditions: dict, reference_time: float | None = None) -> dict:
         total_laps = conditions.get("total_laps", 53)
         strategy = strategy_json.get("strategy", [])
         team_name = strategy_json.get("team_name", "Unknown")
@@ -533,50 +666,65 @@ class StrategyValidator:
                 if "start_lap" not in s:
                     issues.append(f"Stint {i + 1}: manca start_lap")
                     format_score -= 20
-                if i > 0:
-                    prev_start = sorted_strat[i - 1].get("start_lap", 0)
-                    curr_start = s.get("start_lap", 0)
-                    if curr_start <= prev_start:
-                        issues.append(f"Stint {i + 1}: start_lap non monotono crescente")
-                        format_score -= 20
+                if i > 0 and s.get("start_lap", 0) <= sorted_strat[i - 1].get("start_lap", 0):
+                    issues.append(f"Stint {i + 1}: start_lap non monotono crescente")
+                    format_score -= 20
 
-            # Copertura giri
-            last_start = sorted_strat[-1].get("start_lap", 1)
-            if last_start > total_laps:
+            if sorted_strat[-1].get("start_lap", 1) > total_laps:
                 issues.append(f"L'ultimo stint inizia oltre il giro {total_laps}")
                 format_score -= 20
 
         format_score = max(0.0, format_score)
 
-        # ── 2. Stima tempo totale con ML ───────────────────────────────────
-        ml_result = None
-        time_score = 50.0  # default neutro se non calcolabile
+        # ── 2. Constraint fisici meteo ─────────────────────────────────────
+        # Questi vengono valutati SEMPRE, anche se il formato è invalido,
+        # perché sono constraint di sicurezza indipendenti.
+        weather_issues, weather_warnings, weather_penalty = [], [], 0.0
+        rain_issues, rain_penalty = [], 0.0
 
-        if not issues:  # solo se il formato è valido
+        if strategy:
+            weather_issues, weather_warnings, weather_penalty = self._check_weather_constraints(strategy, conditions)
+            rain_issues, rain_penalty = self._check_rain_coverage(strategy, conditions)
+
+        # Issues meteo gravi (slick + pioggia pesante) bloccano la validità
+        issues += weather_issues
+        warnings += weather_warnings
+        issues += rain_issues
+
+        # ── 3. Stima tempo totale con ML ───────────────────────────────────
+        ml_result = None
+        total_time = None
+        time_score = 50.0
+
+        if not [i for i in issues if "ILLEGALE" in i or "SLICK CON PIOGGIA PESANTE" in i]:
+            # Calcola il tempo ML solo se non ci sono violazioni bloccanti
             try:
                 ml_result = self.evaluator.evaluate_strategy(strategy, conditions)
                 total_time = ml_result["total_time"]
 
                 if reference_time is not None and reference_time > 0:
-                    # Punteggio relativo: 100 se uguale al reference, -1pt ogni secondo in più
                     delta = total_time - reference_time
                     time_score = max(0.0, 100.0 - delta * 0.5)
                 else:
-                    # Senza reference: punteggio basato su range atteso
-                    # Monza 53 giri: range tipico 4500–4800s
                     time_score = max(0.0, 100.0 - max(0.0, total_time - 4500) * 0.1)
+
+                # Applica penalità meteo al time_score (non al tempo stimato,
+                # che il modello ML potrebbe non catturare correttamente
+                # per condizioni mai viste nel training)
+                time_score = max(0.0, time_score - weather_penalty - rain_penalty)
+
             except Exception as e:
                 warnings.append(f"Errore stima tempo ML: {e}")
-                total_time = None
-                time_score = 0.0
+                time_score = max(0.0, 50.0 - weather_penalty - rain_penalty)
         else:
-            total_time = None
+            # Strategia con violazione grave: time_score minimo
+            time_score = max(0.0, 10.0 - weather_penalty)
 
-        # ── 3. Rischio degrado ─────────────────────────────────────────────
+        # ── 4. Rischio degrado ─────────────────────────────────────────────
         degradation_report = []
         degr_score = 100.0
 
-        if not issues and strategy:
+        if strategy and not [i for i in issues if "start_lap" in i or "vuota" in i]:
             sorted_strat = sorted(strategy, key=lambda x: x.get("start_lap", 0))
             for i, s in enumerate(sorted_strat):
                 compound = s.get("compound", "medium").lower()
@@ -602,27 +750,25 @@ class StrategyValidator:
 
         degr_score = max(0.0, degr_score)
 
-        # ── 4. Qualità timing SC ───────────────────────────────────────────
+        # ── 5. Qualità timing SC ───────────────────────────────────────────
         sc_report = {}
-        sc_score = 50.0  # neutro se non c'è SC
+        sc_score = 50.0
 
-        if conditions.get("safety_car", {}).get("active") and not issues:
+        if conditions.get("safety_car", {}).get("active") and strategy:
             sc_report = self.evaluator.sc_model.evaluate_strategy_sc_timing(strategy, conditions)
             saving = sc_report.get("total_sc_saving_seconds", 0)
-            # Ogni secondo guadagnato dalla SC vale +2 punti, max 100
             sc_score = min(100.0, 50.0 + saving * 2)
 
             for pit in sc_report.get("pit_stops", []):
-                if pit["timing_quality"] == "EXCELLENT":
-                    pass  # già reflesso nel saving
-                elif pit["timing_quality"] == "NEUTRAL" and pit.get("sc_distance") is not None:
-                    if pit["sc_distance"] < 10:
+                if pit["timing_quality"] == "NEUTRAL":
+                    sc_lap = conditions.get("safety_car", {}).get("lap")
+                    dist = abs(pit["pit_lap"] - sc_lap) if sc_lap else None
+                    if dist is not None and dist <= 8:
                         warnings.append(
-                            f"Pit G.{pit['pit_lap']}: SC al G.{sc_report['sc_lap']}, "
-                            f"distanza {pit['sc_distance']} giri — opportunità persa"
+                            f"Pit G.{pit['pit_lap']}: SC al G.{sc_lap} — distanza {dist} giri, opportunità non sfruttata"
                         )
 
-        # ── 5. Punteggio composito ─────────────────────────────────────────
+        # ── 6. Punteggio composito ─────────────────────────────────────────
         composite_score = (
             self.W_TIME * time_score + self.W_DEGR * degr_score + self.W_SC * sc_score + self.W_FORMAT * format_score
         )
@@ -648,29 +794,44 @@ class StrategyValidator:
     def rank_strategies(self, strategies: list[dict], conditions: dict) -> list[dict]:
         """
         Valida e classifica più strategy.json.
-        Input: lista di dict {"team_name": ..., "strategy": [...], ...}
-        Output: lista ordinata per punteggio composito (decrescente).
+        Il reference_time è il miglior tempo stimato tra le strategie VALIDE
+        (senza violazioni fisiche gravi), così le strategie illegali non
+        abbassano artificialmente il reference.
         """
-        # Prima passata: stima tutti i tempi per calcolare il reference
-        times = []
+        # Prima passata: stima i tempi delle sole strategie valide per il reference
+        valid_times = []
         for strat in strategies:
-            if strat.get("strategy"):
+            if not strat.get("strategy"):
+                continue
+            # Check rapido violazioni gravi prima di chiamare ML
+            rain_intensity = conditions.get("weather", {}).get("rain_intensity", "none")
+            rain_start = conditions.get("weather", {}).get("rain_start_lap", 999)
+            total_laps = conditions.get("total_laps", 53)
+            has_critical = False
+            if rain_intensity == "heavy":
+                sorted_s = sorted(strat["strategy"], key=lambda x: x.get("start_lap", 0))
+                for i, s in enumerate(sorted_s):
+                    end_lap = sorted_s[i + 1]["start_lap"] - 1 if i + 1 < len(sorted_s) else total_laps
+                    rain_laps = max(0, end_lap - max(s.get("start_lap", 1), rain_start) + 1) if rain_start <= end_lap else 0
+                    if s.get("compound", "").lower() in self.SLICK_COMPOUNDS and rain_laps > 0:
+                        has_critical = True
+                        break
+            if not has_critical:
                 try:
                     r = self.evaluator.evaluate_strategy(strat["strategy"], conditions)
-                    times.append(r["total_time"])
+                    valid_times.append(r["total_time"])
                 except Exception:
                     pass
 
-        reference_time = min(times) if times else None
+        reference_time = min(valid_times) if valid_times else None
 
-        # Seconda passata: valutazione completa con reference
+        # Seconda passata: validazione completa
         results = []
         for strat in strategies:
             report = self.validate(strat, conditions, reference_time=reference_time)
             results.append(report)
 
-        results.sort(key=lambda x: x["scores"]["composite"], reverse=True)
-
+        results.sort(key=lambda x: (x["valid"], x["scores"]["composite"]), reverse=True)
         for i, r in enumerate(results):
             r["rank"] = i + 1
 

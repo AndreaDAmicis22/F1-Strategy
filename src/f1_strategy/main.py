@@ -186,7 +186,6 @@ def run_pipeline(
     elapsed = time.time() - start_time
     logger.info(f"\n{'=' * 60}")
     logger.info(f"  Completato in {elapsed:.1f}s")
-    logger.info(f"{'=' * 60}")
 
     # Stampa riepilogo
     print("\n" + "=" * 60)

@@ -1,0 +1,10 @@
+{
+  "team_name": "Aggressive-Sprint",
+  "strategy": [
+    { "stint": 1, "compound": "medium", "start_lap": 1 },
+    { "stint": 2, "compound": "medium", "start_lap": 18 },
+    { "stint": 3, "compound": "soft", "start_lap": 38 }
+  ],
+  "rationale": "Strategia a 2 soste per sfruttare la velocità della gomma Soft a fine gara con auto leggera (session_progression > 0.7). Punta a compensare il costo extra del pit con giri record.",
+  "estimated_total_time_seconds": 4562.15
+}

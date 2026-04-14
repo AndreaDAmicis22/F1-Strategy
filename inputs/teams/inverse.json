@@ -1,0 +1,9 @@
+{
+  "team_name": "Track-Position-Pro",
+  "strategy": [
+    { "stint": 1, "compound": "soft", "start_lap": 1 },
+    { "stint": 2, "compound": "hard", "start_lap": 12 }
+  ],
+  "rationale": "Sfrutta l'extra grip iniziale della Soft per superare nel traffico. La Hard viene montata presto per fare un 'undercut' massiccio su tutto il midfield.",
+  "estimated_total_time_seconds": 4602.30
+}
