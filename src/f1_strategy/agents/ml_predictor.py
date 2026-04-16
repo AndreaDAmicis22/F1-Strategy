@@ -465,11 +465,11 @@ class StrategyEvaluator:
                 # C. Penalità meteo (Guardrail rimangono invariati)
                 is_slick = compound.lower() in {"soft", "medium", "hard"}
                 if rain_intens == "light" and is_slick:
-                    lap_time += 3.0
+                    lap_time += 5.0
                 elif rain_intens == "heavy" and is_slick:
-                    lap_time += 6.0
+                    lap_time += 10.0
                 elif rain_intens == "dry" and compound.lower() in {"intermediate", "wet"}:
-                    lap_time += 2.0
+                    lap_time += 3.0
 
             # Aggiornamento stato
             current_prev_lap_time = lap_time
@@ -498,23 +498,37 @@ class StrategyEvaluator:
         }
 
     def get_models_info(self) -> dict:
+        """Ritorna i metadati e le performance dei modelli caricati."""
         metrics = self.lap_model.evaluate()
+
+        # Recuperiamo i metadati del modello di degradazione per mostrare le soglie usate
+        degr_metadata = getattr(self.deg_model, "metadata", {})
+
         return {
             "lap_time_predictor": {
-                "type": "GradientBoostingRegressor",
-                "trained_on": "dati reali OpenF1",
+                "type": "GradientBoostingRegressor (GBR)",
+                "trained_on": "OpenF1 Real Data",
+                "features": self.lap_model.features,
                 "metrics": metrics,
                 "feature_importance": self.lap_model.feature_importance(),
             },
             "degradation_risk_model": {
-                "type": "Ridge(poly=2) per compound",
-                "trained_on": "dati reali OpenF1",
-                "cliffs": {c: self.deg_model.get_cliff(c) for c in self.deg_model.models},
+                "type": "Incremental Step GBR (per compound)",
+                "trained_on": "OpenF1 Real Data",
+                "compounds_stats": {
+                    c: {
+                        "cliff_lap": info.get("cliff_lap"),
+                        "threshold_s": info.get("threshold_used"),
+                        "n_train": info.get("n_train"),
+                    }
+                    for c, info in degr_metadata.items()
+                },
             },
             "sc_impact_model": {
                 "type": "GradientBoostingRegressor",
-                "trained_on": "pit stop reali OpenF1",
-                "fallback": self.sc_model.fallback,
+                "trained_on": "OpenF1 Pit Stop Data",
+                "status": "Modello ML" if not self.sc_model.fallback else "Fallback Analitico",
+                "fallback_active": self.sc_model.fallback,
             },
         }
 
@@ -667,7 +681,6 @@ class StrategyValidator:
         return [], 0.0
 
     # ── validate ──────────────────────────────────────────────────────────────
-
     def validate(self, strategy_json: dict, conditions: dict, reference_time: float | None = None) -> dict:
         total_laps = conditions.get("total_laps", 53)
         strategy = strategy_json.get("strategy", [])
@@ -768,17 +781,21 @@ class StrategyValidator:
                 risk = self.evaluator.deg_model.assess_stint_risk(compound, stint_len)
                 degradation_report.append(risk)
 
+                cliff_lap = risk["cliff_lap"]
+                extra_laps = stint_len - cliff_lap
+
                 if risk["risk_level"] == "HIGH":
                     degr_score -= 25
                     warnings.append(
-                        f"Stint {i + 1} ({compound.upper()}): {stint_len} giri supera "
-                        f"il cliff di {risk['cliff_lap']} giri "
-                        f"(+{risk['penalty_seconds']:.1f}s di degrado extra)"
+                        f"Stint {i + 1} ({compound.upper()}): Raggiunto limite fisico della gomma al giro {cliff_lap}. "
+                        f"Percorsi {extra_laps} giri in over-stretch con una perdita media di +{risk['penalty_seconds']:.1f}s/giro."
                     )
                 elif risk["risk_level"] == "MEDIUM":
                     degr_score -= 10
+                    # Qui usiamo stint_len/cliff_lap per mostrare quanto siamo al limite
                     warnings.append(
-                        f"Stint {i + 1} ({compound.upper()}): {stint_len} giri vicino al cliff ({risk['cliff_lap']} giri)"
+                        f"Stint {i + 1} ({compound.upper()}): Stint al limite ({stint_len}/{cliff_lap} giri). "
+                        "Rischio crollo prestazioni elevato per i giri finali."
                     )
 
         degr_score = max(0.0, degr_score)

@@ -185,9 +185,9 @@ def train_lap_time_model(df: pd.DataFrame, test_circuit: str | None = None) -> d
             (
                 "gbr",
                 GradientBoostingRegressor(
-                    n_estimators=300,
-                    max_depth=5,
-                    learning_rate=0.07,
+                    n_estimators=600,
+                    max_depth=7,
+                    learning_rate=0.04,
                     subsample=0.8,
                     min_samples_leaf=10,
                     random_state=42,
@@ -305,7 +305,14 @@ def train_degradation_model(df: pd.DataFrame, test_circuit: str | None = None) -
             test_mae = round(float(mean_absolute_error(y_test, model.predict(X_test))), 4)
 
         # 6. Simulazione Cliff (per metadati)
-        # Simuliamo lo stint accumulando i 'step' predetti
+        thresholds = {
+            "soft": 1.0,
+            "medium": 1.7,
+            "hard": 2.25,
+            "intermediate": 3.8,  # Alzata da 1.3: permetterà circa 20-25 giri prima del cliff
+            "wet": 5.0,
+        }
+        current_threshold = thresholds.get(compound.lower(), 1.5)
         meds = {f: float(sub_train[f].median()) for f in avail_features}
         meds["session_progression"] = 0.5
         meds["lap_number"] = 27
@@ -322,29 +329,37 @@ def train_degradation_model(df: pd.DataFrame, test_circuit: str | None = None) -
             return float(model.predict(np.array([row], dtype=np.float32))[0])
 
         accumulated_degr = 0.0
-        cliff_lap = 54
+        cliff_lap = 54  # Fallback se non raggiunge mai la soglia
+
         for lap in range(1, 61):
             step = get_step_pred(lap)
-            # Solo incrementi positivi per la simulazione del cliff
+            # Solo incrementi positivi: la gomma non rigenera mai performance
             accumulated_degr += max(0.0, step)
-            if accumulated_degr > 1.5:
+
+            # Verifichiamo se l'usura accumulata ha sfondato la soglia specifica del compound
+            if accumulated_degr > current_threshold:
                 cliff_lap = lap
                 break
 
+        # Salvataggio nel dizionario dei modelli e risultati
         models[compound] = model
         results[compound] = {
             "features": avail_features,
             "cliff_lap": cliff_lap,
+            "threshold_used": current_threshold,
             "test_mae": test_mae,
             "n_train": len(sub_train),
         }
-        logger.info(f"  {compound:<12} | Cliff: {cliff_lap:>2} | Step MAE: {test_mae} | Feat: {len(avail_features)}")
 
-    # Salvataggio
+        logger.info(f"  {compound:<12} | Cliff: {cliff_lap:>2} (Soglia: {current_threshold}s) | MAE: {test_mae}")
+
+    # Salvataggio su disco del file pkl
     path = MODEL_DIR / "degradation_model.pkl"
     with open(path, "wb") as f:
+        # Salviamo la struttura completa per il validatore
         pickle.dump({"models": models, "metadata": results}, f)
 
+    logger.info(f"=== Modello Degradazione salvato in {path} ===")
     return {"type": "GBR Incremental Step", "compounds": results}
 
 
@@ -466,9 +481,9 @@ def train_sc_impact_model(df: pd.DataFrame, test_circuit: str | None = None) -> 
             (
                 "gbr",
                 GradientBoostingRegressor(
-                    n_estimators=800,
-                    max_depth=8,
-                    learning_rate=0.03,
+                    n_estimators=100,
+                    max_depth=7,
+                    learning_rate=0.04,
                     subsample=0.8,
                     random_state=42,
                 ),

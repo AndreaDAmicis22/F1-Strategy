@@ -41,7 +41,7 @@ DEFAULT_CONDITIONS = {
         "type": "variable",
         "description": "Asciutto fino al giro 30, poi pioggia leggera fino a fine gara",
         "rain_start_lap": 30,
-        "rain_intensity": "light",
+        "rain_intensity": "none",
     },
     "safety_car": {"active": True, "lap": 15, "duration_laps": 3},
     "grid_position": 6,
@@ -50,7 +50,8 @@ DEFAULT_CONDITIONS = {
 
 
 def load_conditions(path=None) -> dict:
-    path = Path(__file__).parent.parent.parent.parent / "inputs" / "race_conditions.json" if path is None else Path(path)
+    path = Path(__file__).parent.parent.parent / "inputs" / "race_conditions.json" if path is None else Path(path)
+    logger.info(f"Caricamento condizioni da: {path}")
     if not path.exists():
         logger.warning(f"race_conditions.json non trovato: {path}. Uso default Monza.")
         return DEFAULT_CONDITIONS
