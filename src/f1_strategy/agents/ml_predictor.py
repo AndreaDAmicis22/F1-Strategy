@@ -458,22 +458,18 @@ class StrategyEvaluator:
 
                 # Accumuliamo il danno (monotonicità garantita)
                 accumulated_usura += max(0.0, step_degr)
-                # logger.info(f" Lap {lap} ({compound}): Usura accumulata +{accumulated_usura:.3f}s")
 
                 # Applichiamo l'usura accumulata al tempo base
                 lap_time += accumulated_usura
 
-                if stint_lap % 5 == 0:  # Logga ogni 5 giri per non intasare
-                    logger.info(f" Lap {lap} ({compound}): Usura accumulata +{accumulated_usura:.3f}s")
-
                 # C. Penalità meteo (Guardrail rimangono invariati)
                 is_slick = compound.lower() in {"soft", "medium", "hard"}
-                if weather == "light_rain" and is_slick:
-                    lap_time += 7.0
-                elif weather == "heavy_rain" and is_slick:
-                    lap_time += 20.0
-                elif weather == "dry" and compound.lower() in {"intermediate", "wet"}:
-                    lap_time += 5.0
+                if rain_intens == "light" and is_slick:
+                    lap_time += 3.0
+                elif rain_intens == "heavy" and is_slick:
+                    lap_time += 6.0
+                elif rain_intens == "dry" and compound.lower() in {"intermediate", "wet"}:
+                    lap_time += 2.0
 
             # Aggiornamento stato
             current_prev_lap_time = lap_time
@@ -737,9 +733,11 @@ class StrategyValidator:
                 ml_result = self.evaluator.evaluate_strategy(strategy, conditions)
                 total_time = ml_result["total_time"]
 
-                if reference_time is not None and reference_time > 0:
-                    delta = total_time - reference_time
-                    time_score = max(0.0, 100.0 - delta * 0.5)
+                if reference_time is not None:
+                    delta_seconds = total_time - reference_time
+                    # Invece di 0.5 (molto severo), usa un divisore più morbido
+                    # o una percentuale (es. 100 punti se entro il 2% del tempo reference)
+                    time_score = max(0.0, 100.0 - (delta_seconds / 5.0))
                 else:
                     time_score = max(0.0, 100.0 - max(0.0, total_time - 4500) * 0.1)
 
