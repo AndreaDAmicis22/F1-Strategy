@@ -1,17 +1,15 @@
-{
-  "circuit": "Monza",
-  "total_laps": 53,
-  "weather": {
-    "type": "variable",
-    "description": "Meteo asciutto per tutta la gara",
-    "rain_start_lap": 999,
-    "rain_intensity": "none"
+{ 
+  "circuit": "Monza", 
+  "total_laps": 53, 
+  "weather": { 
+    "rain_start_lap": 999, 
+    "rain_intensity": "none" 
+  }, 
+  "safety_car": { 
+    "active": true, 
+    "lap": 16, 
+    "duration_laps": 4
   },
-  "safety_car": {
-    "active": true,
-    "lap": 20,
-    "duration_laps": 3
-  },
-  "grid_position": 3,
-  "pit_lane_time_loss_seconds": 23.5
+   "pit_lane_avg_time_loss_seconds": 22.5, 
+   "pit_lane_std_time_loss_seconds ": 0.4
 }

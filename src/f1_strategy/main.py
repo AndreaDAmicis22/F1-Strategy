@@ -22,6 +22,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "agents"))
 
@@ -37,15 +39,10 @@ logger = logging.getLogger("main")
 DEFAULT_CONDITIONS = {
     "circuit": "Monza",
     "total_laps": 53,
-    "weather": {
-        "type": "variable",
-        "description": "Asciutto fino al giro 30, poi pioggia leggera fino a fine gara",
-        "rain_start_lap": 30,
-        "rain_intensity": "none",
-    },
+    "weather": {"rain_start_lap": 30, "rain_intensity": "light"},
     "safety_car": {"active": True, "lap": 15, "duration_laps": 3},
-    "grid_position": 6,
-    "pit_lane_time_loss_seconds": 22.5,
+    "pit_lane_avg_time_loss_seconds": 22.5,
+    "pit_lane_std_time_loss_seconds ": 0.4,
 }
 
 
@@ -106,6 +103,10 @@ def run_pipeline(
         f"Meteo: {conditions.get('weather', {}).get('type')} | "
         f"SC: giro {conditions.get('safety_car', {}).get('lap', 'N/A')}"
     )
+    avg_loss = conditions.get("pit_lane_avg_time_loss_seconds", 22.5)
+    std_val = conditions.get("pit_lane_std_time_loss_seconds", 0.4)
+    pit_offset = np.random.normal(loc=0.0, scale=std_val) if std_val > 0 else 0.0
+    session_pit_loss = round(avg_loss + pit_offset, 3)
 
     # ── Carica strategie da validare ───────────────────────────────────────
     strategies = []
@@ -151,7 +152,7 @@ def run_pipeline(
     # ── Validazione e ranking ──────────────────────────────────────────────
     logger.info("\n[2/3] Validazione e ranking strategie con ML...")
     validator = StrategyValidator(evaluator)
-    ranking = validator.rank_strategies(strategies, conditions)
+    ranking = validator.rank_strategies(strategies, conditions, session_pit_loss)
 
     for r in ranking:
         status = "✓" if r["valid"] else "✗"
@@ -196,11 +197,7 @@ def run_pipeline(
         status = "✓" if r["valid"] else "✗ INVALIDA"
         time_str = f"{r['estimated_total_time']:.0f}s" if r["estimated_total_time"] else "N/A"
         print(f"  #{r['rank']} {r['team_name']}")
-        print(f"     Score: {r['scores']['composite']:.1f}/100  |  Tempo ML: {time_str}  {status}")
-        print(
-            f"     Tempi: {r['scores']['time']:.0f}  Degrado: {r['scores']['degradation']:.0f}  "
-            f"SC: {r['scores']['sc_timing']:.0f}  Formato: {r['scores']['format']:.0f}"
-        )
+        print(f"     Tempo ML: {time_str}  {status}")
         if r["warnings"]:
             for w in r["warnings"][:2]:
                 print(f"     ⚠ {w}")

@@ -1,9 +1,8 @@
 {
   "team_name": "Standard-Master",
   "strategy": [
-    { "stint": 1, "compound": "medium", "start_lap": 1 },
-    { "stint": 2, "compound": "hard", "start_lap": 26 }
+    { "stint": 1, "compound": "soft", "start_lap": 1 },
+    { "stint": 2, "compound": "hard", "start_lap": 16 }
   ],
-  "rationale": "Strategia classica 1-stop. Il pit al giro 26 massimizza la vita utile della Medium senza cadere nel cliff. La Hard garantisce stabilità termica nella seconda metà di gara.",
-  "estimated_total_time_seconds": 4584.20
+  "rationale": "Strategia classica 'One-Stop' ottimizzata per Monza. Il primo stint su Soft (25 giri) permette di sfruttare il picco prestazionale della vettura con alto carico di carburante, rientrando ai box esattamente sulla soglia del cliff previsto dal modello (~25 giri). Il passaggio alla Hard al giro 26 garantisce la massima stabilità termica e costanza nei tempi sul giro fino alla bandiera a scacchi, minimizzando il rischio di degrado eccessivo nel finale di gara e offrendo una finestra tattica ideale in caso di Safety Car nella parte centrale della corsa."
 }

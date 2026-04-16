@@ -22,9 +22,10 @@ BASE_DIR = Path(__file__).parent.parent.parent.parent
 MODEL_DIR = BASE_DIR / "models"
 
 COMPOUND_ENC = {"soft": 0, "medium": 1, "hard": 2, "intermediate": 3, "wet": 4}
-WEATHER_ENC = {"dry": 0, "light_rain": 1, "heavy_rain": 2}
+is_raining = {"dry": 0, "light_rain": 1, "heavy_rain": 2}
 
 NORMAL_PIT_COST_SECONDS = 22.5
+NORMAL_PIT_COST_STD_SECONDS = 0.4
 
 
 class ModelNotTrainedError(RuntimeError):
@@ -72,7 +73,7 @@ class LapTimePredictor:
             "compound_enc": COMPOUND_ENC.get(compound.lower(), 1),
             "stint_lap": stint_lap,
             "stint_lap_sq": stint_lap**2,
-            "weather_enc": WEATHER_ENC.get(weather, 0),
+            "is_raining": is_raining.get(weather, 0),
             "air_temp": air_temp,
             "track_temp": track_temp,
             "lap_number": lap_number,
@@ -163,9 +164,8 @@ class DegradationRiskModel:
             "air_temp": air_temp,
             "lap_number": lap_number,
             "session_progression": lap_number / max(max_session_laps, 1),
-            "weather_enc": WEATHER_ENC.get(weather, 0),
+            "is_raining": is_raining.get(weather, 0),
             "compound_enc": COMPOUND_ENC.get(compound_key, 1),
-            # Feature di contesto base (fallback se non presenti in race_conditions.json)
             "speed_mean": kwargs.get("speed_mean", 210.0),
             "avg_energy_session": kwargs.get("avg_energy_session", (210.0 * track_temp) / 100),
             "prev_lap_duration": prev_lap_duration,
@@ -281,7 +281,7 @@ class SafetyCarImpactModel:
             "sc_duration_step": kwargs.get("sc_duration_step", (dist if sc_active and dist > 0 else 0)),
             "compound_enc": COMPOUND_ENC.get(compound.lower(), 1),
             "lap_number": pit_lap,
-            "weather_enc": WEATHER_ENC.get(weather, 0),
+            "is_raining": is_raining.get(weather, 0),
             "track_temp": track_temp,
             "rainfall": kwargs.get("rainfall", 0.0),
         }
@@ -296,11 +296,10 @@ class SafetyCarImpactModel:
             logger.warning(f"Errore prediction SC: {e}. Uso fallback.")
             return pit_lane_seconds if not sc_active else 12.0
 
-    def evaluate_strategy_sc_timing(self, strategy: list, conditions: dict) -> dict:
+    def evaluate_strategy_sc_timing(self, strategy: list, conditions: dict, session_pit_loss: float) -> dict:
         sc_active = conditions.get("safety_car", {}).get("active", False)
         sc_lap = conditions.get("safety_car", {}).get("lap") if sc_active else None
         sc_duration = conditions.get("safety_car", {}).get("duration_laps", 3)
-        pit_lane_base = conditions.get("pit_lane_time_loss_seconds", 23.5)
 
         # Parametri dinamici per la SC
         sc_params = {
@@ -314,8 +313,8 @@ class SafetyCarImpactModel:
             pit_lap = stint["start_lap"]
 
             # Calcoliamo il costo con il modello predetto
-            cost = self.predict_pit_cost(pit_lap, sc_lap, stint["compound"], pit_lane_seconds=pit_lane_base, **sc_params)
-            saving = max(0.0, pit_lane_base - cost)
+            cost = self.predict_pit_cost(pit_lap, sc_lap, stint["compound"], pit_lane_seconds=session_pit_loss, **sc_params)
+            saving = max(0.0, session_pit_loss - cost)
 
             # FORZATURA LOGICA: Se il pit è esattamente durante la finestra SC,
             # la qualità DEVE essere EXCELLENT, a prescindere da piccole oscillazioni del modello ML
@@ -348,7 +347,6 @@ class SafetyCarImpactModel:
 
 
 # ── StrategyEvaluator ─────────────────────────────────────────────────────────
-# ── StrategyEvaluator ─────────────────────────────────────────────────────────
 class StrategyEvaluator:
     """
     Valuta una strategia giro per giro usando LapTimePredictor.
@@ -363,17 +361,16 @@ class StrategyEvaluator:
     def load(cls) -> StrategyEvaluator:
         return cls()
 
-    def evaluate_strategy(self, strategy: list, conditions: dict, track_temp: float = 38.0, air_temp: float = 25.0) -> dict:
+    def evaluate_strategy(
+        self, strategy: list, conditions: dict, session_pit_loss: float, track_temp: float = 38.0, air_temp: float = 25.0
+    ) -> dict:
         total_laps = conditions.get("total_laps", 53)
-        pit_lane_base = conditions.get("pit_lane_time_loss_seconds", NORMAL_PIT_COST_SECONDS)
 
         # Info Safety Car
         sc_info = conditions.get("safety_car", {})
         sc_active = sc_info.get("active", False)
         sc_lap_trigger = sc_info.get("lap", -1)
         sc_duration = sc_info.get("duration_laps", 0)
-        # IMPORTANTE: In F1 il Delta SC è circa +40/60% sul tempo sul giro.
-        # Usiamo un moltiplicatore, non una divisione drastica.
         sc_time_multiplier = 1.5
 
         # Info Meteo
@@ -394,30 +391,39 @@ class StrategyEvaluator:
         total_time = 0.0
         lap_results = []
         pit_stops = 0
-        current_prev_lap_time = 90.0  # Valore di partenza realistico per Monza
+        current_prev_lap_time = 85.0
         accumulated_usura = 0.0
-        current_stint_start = -1
+        sc_pit_done = False
 
         for lap in range(1, total_laps + 1):
+            # 1. IDENTIFICAZIONE STINT ATTUALE
+            # Se abbiamo anticipato il pit, dobbiamo assicurarci di prendere il compound corretto
             stint = lap_to_stint.get(lap)
             if not stint:
                 continue
 
-            # RESET USURA AL PIT STOP
-            if stint["start_lap"] != current_stint_start:
-                accumulated_usura = 0.0
-                current_stint_start = stint["start_lap"]
-
             compound = stint["compound"]
             stint_lap = lap - stint["start_lap"] + 1
-            weather = ("heavy_rain" if rain_intens == "heavy" else "light_rain") if lap >= rain_start else "dry"
-
-            # Check se siamo sotto Safety Car
             is_sc_active_this_lap = sc_active and sc_lap_trigger <= lap < (sc_lap_trigger + sc_duration)
 
-            # 1. GESTIONE PIT STOP
+            # --- LOGICA PIT STOP ---
+            # Caso A: È il giro previsto dal JSON
             is_pit = lap == stint["start_lap"] and lap > 1
-            pit_cost = 0.0
+
+            # Caso B: ANTICIPO TATTICO (La modifica che non era chiara)
+            # Se c'è la SC e non abbiamo ancora fatto il pit "scontato"...
+            if is_sc_active_this_lap and not sc_pit_done:
+                # Cerchiamo quando era previsto il prossimo pit stop
+                next_planned_pit = next((s["start_lap"] for s in sorted_strat if s["start_lap"] > lap), 999)
+
+                # Se il pit previsto era tra poco (es. 8 giri), lo facciamo ORA
+                if next_planned_pit - lap <= 8:
+                    is_pit = True
+                    sc_pit_done = True
+
+            # 1. GESTIONE PIT STOP
+            weather = ("heavy_rain" if rain_intens == "heavy" else "light_rain") if lap >= rain_start else "dry"
+            is_pit = lap == stint["start_lap"] and lap > 1
             if is_pit:
                 sc_lap_val = sc_lap_trigger if sc_active else None
                 pit_cost = self.sc_model.predict_pit_cost(
@@ -426,35 +432,49 @@ class StrategyEvaluator:
                     compound=compound,
                     weather=weather,
                     track_temp=track_temp,
-                    pit_lane_seconds=pit_lane_base,
-                    # Parametri corretti per il modello
+                    pit_lane_seconds=session_pit_loss,
                     sc_speed_ratio=0.4 if is_sc_active_this_lap else 1.0,
                     rainfall=rainfall if lap >= rain_start else 0.0,
                 )
                 total_time += pit_cost
                 pit_stops += 1
+                accumulated_usura = 0.0
 
-            # 2. CALCOLO LAP TIME
+            # 2. CALCOLO STEP DEGRADATION (Base ML)
+            step_degr = self.deg_model.predict_step(
+                compound=compound,
+                stint_lap=stint_lap,
+                weather=weather,
+                track_temp=track_temp,
+                lap_number=lap,
+                max_session_laps=total_laps,
+            )
+
+            # 3. APPLICAZIONE DINAMICA FISICA (Correzione per Monza)
+            cliff_lap = self.deg_model.get_cliff(compound)
+
+            # Moltiplicatori di resilienza/sofferenza per compound
+            if compound == "hard":
+                step_degr *= 0.4  # La Hard a Monza è estremamente stabile
+            elif compound == "soft":
+                step_degr *= 1.5  # La Soft soffre le alte velocità di Monza
+
+            # Penalità esponenziale post-cliff (il "crollo" prestazionale)
+            if stint_lap > cliff_lap:
+                overstretch_penalty = (stint_lap - cliff_lap) ** 1.5 * 0.2
+                step_degr += overstretch_penalty
+
+            # Riduzione usura sotto Safety Car
             if is_sc_active_this_lap:
-                # SOTTO SC: Il tempo è il tempo precedente * moltiplicatore (es. 90s * 1.5 = 135s)
-                lap_time = current_prev_lap_time * sc_time_multiplier
-                # Sotto SC l'usura è ridotta dell'80%
-                step_degr = self.deg_model.predict_step(compound=compound, stint_lap=stint_lap, weather=weather) * 0.2
-                accumulated_usura += max(0.0, step_degr)
-            else:
-                # PASSO NORMALE (GBR)
-                lap_time = self.lap_model.predict(
-                    compound=compound,
-                    stint_lap=stint_lap,
-                    weather=weather,
-                    track_temp=track_temp,
-                    air_temp=air_temp,
-                    lap_number=lap,
-                    max_session_laps=total_laps,
-                    prev_lap_duration=current_prev_lap_time,
-                )
+                step_degr *= 0.15
 
-                step_degr = self.deg_model.predict_step(
+            accumulated_usura += max(0.0, step_degr)
+
+            # 4. CALCOLO LAP TIME FINALE
+            if is_sc_active_this_lap:
+                lap_time = current_prev_lap_time * sc_time_multiplier
+            else:
+                base_lap_time = self.lap_model.predict(
                     compound=compound,
                     stint_lap=stint_lap,
                     weather=weather,
@@ -464,17 +484,14 @@ class StrategyEvaluator:
                     max_session_laps=total_laps,
                     prev_lap_duration=current_prev_lap_time,
                 )
-                accumulated_usura += max(0.0, step_degr)
-                lap_time += accumulated_usura
+                lap_time = base_lap_time + accumulated_usura
 
                 # Guardrail Fisici (Meteo)
-                is_slick = compound.lower() in {"soft", "medium", "hard"}
-                if rain_intens == "light" and is_slick:
-                    lap_time += 5.0
-                elif rain_intens == "heavy" and is_slick:
-                    lap_time += 15.0  # Più severo su heavy
-                elif rain_intens == "dry" and compound.lower() in {"intermediate", "wet"}:
-                    lap_time += 4.0
+                is_slick = compound in {"soft", "medium", "hard"}
+                if rain_intens != "none" and is_slick:
+                    lap_time += 9.0 if rain_intens == "light" else 20.0
+                elif rain_intens == "none" and compound in {"intermediate", "wet"}:
+                    lap_time += 6.0
 
             total_time += lap_time
             current_prev_lap_time = lap_time
@@ -540,10 +557,7 @@ class StrategyValidator:
     indipendentemente dal tempo stimato dal modello.
     """
 
-    W_TIME = 0.50
-    W_DEGR = 0.25
-    W_SC = 0.20
-    W_FORMAT = 0.05
+    W_TIME, W_DEGR, W_SC, W_FORMAT = 0.50, 0.20, 0.25, 0.05
 
     # Compound considerati "slick" (non adatti alla pioggia)
     SLICK_COMPOUNDS = {"soft", "medium", "hard"}
@@ -677,7 +691,9 @@ class StrategyValidator:
         return [], 0.0
 
     # ── validate ──────────────────────────────────────────────────────────────
-    def validate(self, strategy_json: dict, conditions: dict, reference_time: float | None = None) -> dict:
+    def validate(
+        self, strategy_json: dict, conditions: dict, session_pit_loss: float, reference_time: float | None = None
+    ) -> dict:
         total_laps = conditions.get("total_laps", 53)
         strategy = strategy_json.get("strategy", [])
         team_name = strategy_json.get("team_name", "Unknown")
@@ -737,29 +753,23 @@ class StrategyValidator:
         time_score = 50.0
 
         if not [i for i in issues if "ILLEGALE" in i or "SLICK CON PIOGGIA PESANTE" in i]:
-            # Calcola il tempo ML solo se non ci sono violazioni bloccanti
             try:
-                ml_result = self.evaluator.evaluate_strategy(strategy, conditions)
+                ml_result = self.evaluator.evaluate_strategy(strategy, conditions, session_pit_loss)
                 total_time = ml_result["total_time"]
 
                 if reference_time is not None:
                     delta_seconds = total_time - reference_time
-                    # Invece di 0.5 (molto severo), usa un divisore più morbido
-                    # o una percentuale (es. 100 punti se entro il 2% del tempo reference)
-                    time_score = max(0.0, 100.0 - (delta_seconds / 5.0))
+                    # Penalità tempo più severa (4.0 invece di 2.0) per premiare i decimi a Monza
+                    time_score = max(0.0, 100.0 - (delta_seconds * 4.0))
                 else:
                     time_score = max(0.0, 100.0 - max(0.0, total_time - 4500) * 0.1)
 
-                # Applica penalità meteo al time_score (non al tempo stimato,
-                # che il modello ML potrebbe non catturare correttamente
-                # per condizioni mai viste nel training)
                 time_score = max(0.0, time_score - weather_penalty - rain_penalty)
 
             except Exception as e:
                 warnings.append(f"Errore stima tempo ML: {e}")
                 time_score = max(0.0, 50.0 - weather_penalty - rain_penalty)
         else:
-            # Strategia con violazione grave: time_score minimo
             time_score = max(0.0, 10.0 - weather_penalty)
 
         # ── 4. Rischio degrado ─────────────────────────────────────────────
@@ -778,21 +788,14 @@ class StrategyValidator:
                 degradation_report.append(risk)
 
                 cliff_lap = risk["cliff_lap"]
-                extra_laps = max(0, stint_len - cliff_lap)
+                max(0, stint_len - cliff_lap)
 
                 if risk["risk_level"] == "HIGH":
                     degr_score -= 25
-                    warnings.append(
-                        f"Stint {i + 1} ({compound.upper()}): Raggiunto limite fisico della gomma al giro {cliff_lap}. "
-                        f"Percorsi {extra_laps} giri in over-stretch con una perdita media di +{risk['penalty_seconds']:.1f}s/giro."
-                    )
+                    warnings.append(f"Stint {i + 1} ({compound.upper()}): Raggiunto limite fisico della gomma.")
                 elif risk["risk_level"] == "MEDIUM":
                     degr_score -= 10
-                    # Qui usiamo stint_len/cliff_lap per mostrare quanto siamo al limite
-                    warnings.append(
-                        f"Stint {i + 1} ({compound.upper()}): Stint al limite ({stint_len}/{cliff_lap} giri). "
-                        "Rischio crollo prestazioni elevato per i giri finali."
-                    )
+                    warnings.append(f"Stint {i + 1} ({compound.upper()}): Stint al limite.")
 
         degr_score = max(0.0, degr_score)
 
@@ -801,18 +804,28 @@ class StrategyValidator:
         sc_score = 50.0
 
         if conditions.get("safety_car", {}).get("active") and strategy:
-            sc_report = self.evaluator.sc_model.evaluate_strategy_sc_timing(strategy, conditions)
-            saving = sc_report.get("total_sc_saving_seconds", 0)
-            sc_score = min(100.0, 50.0 + saving * 2)
+            sc_report = self.evaluator.sc_model.evaluate_strategy_sc_timing(strategy, conditions, session_pit_loss)
 
-            for pit in sc_report.get("pit_stops", []):
-                if pit["timing_quality"] == "NEUTRAL":
-                    sc_lap = conditions.get("safety_car", {}).get("lap")
-                    dist = abs(pit["pit_lap"] - sc_lap) if sc_lap else None
-                    if dist is not None and dist <= 8:
-                        warnings.append(
-                            f"Pit G.{pit['pit_lap']}: SC al G.{sc_lap} — distanza {dist} giri, opportunità non sfruttata"
-                        )
+            # --- 5.1 CHECK ANTICIPO TATTICO SC (CRUCIALE) ---
+            sc_pit_actual = any(
+                lap.get("is_pit_lap") and lap.get("is_sc_lap") for lap in (ml_result["lap_results"] if ml_result else [])
+            )
+
+            if sc_pit_actual:
+                sc_score = 100.0
+                warnings = [w for w in warnings if "opportunità non sfruttata" not in w]
+            else:
+                saving = sc_report.get("total_sc_saving_seconds", 0)
+                sc_score = 40.0 + (saving * 5.0)
+
+                for pit in sc_report.get("pit_stops", []):
+                    if pit["timing_quality"] == "NEUTRAL":
+                        sc_lap = conditions.get("safety_car", {}).get("lap")
+                        dist = abs(pit["pit_lap"] - sc_lap) if sc_lap else None
+                        if dist is not None and dist <= 8:
+                            warnings.append(
+                                f"Pit G.{pit['pit_lap']}: SC al G.{sc_lap} — distanza {dist} giri, opportunità non sfruttata"
+                            )
 
         # ── 6. Punteggio composito ─────────────────────────────────────────
         composite_score = (
@@ -837,7 +850,7 @@ class StrategyValidator:
             "sc_report": sc_report,
         }
 
-    def rank_strategies(self, strategies: list[dict], conditions: dict) -> list[dict]:
+    def rank_strategies(self, strategies: list[dict], conditions: dict, session_pit_loss: float) -> list[dict]:
         """
         Valida e classifica più strategy.json.
         Il reference_time è il miglior tempo stimato tra le strategie VALIDE
@@ -864,20 +877,19 @@ class StrategyValidator:
                         break
             if not has_critical:
                 try:
-                    r = self.evaluator.evaluate_strategy(strat["strategy"], conditions)
+                    r = self.evaluator.evaluate_strategy(strat["strategy"], conditions, session_pit_loss)
                     valid_times.append(r["total_time"])
                 except Exception:
                     pass
 
         reference_time = min(valid_times) if valid_times else None
 
-        # Seconda passata: validazione completa
         results = []
         for strat in strategies:
-            report = self.validate(strat, conditions, reference_time=reference_time)
+            report = self.validate(strat, conditions, session_pit_loss, reference_time=reference_time)
             results.append(report)
 
-        results.sort(key=lambda x: (x["valid"], x["scores"]["composite"]), reverse=True)
+        results.sort(key=lambda x: (not x["valid"], x["estimated_total_time"] or float("inf")))
         for i, r in enumerate(results):
             r["rank"] = i + 1
 

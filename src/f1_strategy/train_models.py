@@ -54,7 +54,7 @@ def load_and_clean(csv_path: Path, erase_stop_sc: bool = True) -> pd.DataFrame:
 
     df["compound_enc"] = df["compound"].map(COMPOUND_ENC)
     df["rainfall"] = df["rainfall"].fillna(0.0)
-    df["weather_enc"] = df["rainfall"].apply(lambda r: 2 if r > 2.0 else (1 if r > 0.1 else 0))
+    df["is_raining"] = df["rainfall"].apply(lambda r: 1 if r > 0.0 else 0)
 
     for col in ["air_temp", "track_temp"]:
         df[col] = df.groupby("session_key")[col].transform(lambda x: x.fillna(x.median()))
@@ -138,7 +138,7 @@ LAP_FEATURES = [
     "compound_enc",
     "stint_lap",
     "stint_lap_sq",
-    "weather_enc",
+    "is_raining",
     "air_temp",
     "track_temp",
     "lap_number",
@@ -185,8 +185,8 @@ def train_lap_time_model(df: pd.DataFrame, test_circuit: str | None = None) -> d
             (
                 "gbr",
                 GradientBoostingRegressor(
-                    n_estimators=600,
-                    max_depth=7,
+                    n_estimators=300,
+                    max_depth=5,
                     learning_rate=0.04,
                     subsample=0.8,
                     min_samples_leaf=10,
@@ -236,7 +236,7 @@ DEGR_FEATURES = [
     "lap_number",
     "session_progression",
     "compound_enc",
-    "weather_enc",
+    "is_raining",
     "track_temp",
     "air_temp",
     "humidity",
@@ -309,7 +309,7 @@ def train_degradation_model(df: pd.DataFrame, test_circuit: str | None = None) -
             "soft": 1.0,
             "medium": 1.7,
             "hard": 2.25,
-            "intermediate": 3.8,  # Alzata da 1.3: permetterà circa 20-25 giri prima del cliff
+            "intermediate": 3.8,
             "wet": 5.0,
         }
         current_threshold = thresholds.get(compound.lower(), 1.5)
@@ -431,7 +431,7 @@ def _build_sc_dataset(df: pd.DataFrame) -> pd.DataFrame | None:
                 "sc_duration_step": float(row["sc_duration_step"]),
                 "compound_enc": COMPOUND_ENC.get(str(row["compound"]).lower(), 1),
                 "lap_number": int(row["lap_number"]),
-                "weather_enc": int(row["weather_enc"]),
+                "is_raining": int(row["is_raining"]),
                 "track_temp": float(row["track_temp"]),
                 "rainfall": float(row.get("rainfall", 0.0)),
                 "pit_cost_delta": float(row["pit_cost_delta"]),
@@ -451,7 +451,7 @@ SC_FEATURES = [
     "sc_duration_step",  # Da quanto tempo la SC è fuori
     "compound_enc",
     "lap_number",
-    "weather_enc",
+    "is_raining",
     "track_temp",
     "rainfall",  # Importante per i tempi di reazione del pit
 ]
@@ -557,7 +557,7 @@ def run(csv_path: Path | None = None, test_circuit: str | None = None):
         return None
 
     reports = {
-        # "lap_time_model": train_lap_time_model(df, test_circuit),
+        "lap_time_model": train_lap_time_model(df, test_circuit),
         "degradation_model": train_degradation_model(df, test_circuit),
         "sc_impact_model": train_sc_impact_model(df_raw, test_circuit),
     }
