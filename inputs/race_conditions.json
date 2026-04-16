@@ -3,9 +3,9 @@
   "total_laps": 53,
   "weather": {
     "type": "variable",
-    "description": "Asciutto fino al giro 30, poi pioggia pesante fino a fine gara",
-    "rain_start_lap": 30,
-    "rain_intensity": "light"
+    "description": "Meteo asciutto per tutta la gara",
+    "rain_start_lap": 999,
+    "rain_intensity": "none"
   },
   "safety_car": {
     "active": true,
