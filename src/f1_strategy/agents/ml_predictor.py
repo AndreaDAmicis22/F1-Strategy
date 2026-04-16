@@ -119,8 +119,6 @@ class LapTimePredictor:
 
 
 # ── DegradationRiskModel ──────────────────────────────────────────────────────
-
-
 class DegradationRiskModel:
     """
     Ridge polynomial per compound.
@@ -140,75 +138,93 @@ class DegradationRiskModel:
         """Ritorna il giro (stint_lap) dove il degrado supera +2s."""
         return self.metadata.get(compound.lower(), {}).get("cliff_lap", 30)
 
-    def predict_delta(
+    def predict_step(
         self,
         compound: str,
         stint_lap: int,
+        weather: str,
         track_temp: float = 38.0,
         air_temp: float = 25.0,
-        speed_mean: float = 210.0,
-        lap_number: int = 27,
-        total_session_laps: int = 55,
-        weather: int = 0,
+        lap_number: int = 1,
+        max_session_laps: int = 55,
+        prev_lap_duration: float = 90.0,
         **kwargs,
     ) -> float:
-        """
-        Calcola i secondi extra rispetto al best pace dovuti al degrado.
-        """
-        compound = compound.lower()
-        if compound not in self.models:
+        """Predice l'incremento di degrado usando solo i dati disponibili nei JSON."""
+        compound_key = compound.lower()
+        if compound_key not in self.models:
             return 0.0
 
-        features = self.metadata[compound].get("features", ["stint_lap"])
-
-        # Dizionario per mappare i valori correnti alle feature attive nel modello
-        data_map = {
+        # Mapping pulito: solo quello che passa dal simulatore o dai JSON
+        data = {
             "stint_lap": stint_lap,
+            "stint_lap_sq": stint_lap**2,
             "track_temp": track_temp,
             "air_temp": air_temp,
-            "speed_mean": speed_mean,
             "lap_number": lap_number,
-            "session_progression": lap_number / total_session_laps,
-            "weather_enc": weather,
-            "avg_energy_session": kwargs.get("avg_energy_session", (speed_mean * track_temp)),
+            "session_progression": lap_number / max(max_session_laps, 1),
+            "weather_enc": WEATHER_ENC.get(weather, 0),
+            "compound_enc": COMPOUND_ENC.get(compound_key, 1),
+            # Feature di contesto base (fallback se non presenti in race_conditions.json)
+            "speed_mean": kwargs.get("speed_mean", 210.0),
+            "avg_energy_session": kwargs.get("avg_energy_session", (210.0 * track_temp) / 100),
+            "prev_lap_duration": prev_lap_duration,
+            "humidity": kwargs.get("humidity", 50.0),
         }
 
-        # Costruiamo la riga di input nell'ordine corretto salvato nei metadati
-        row = [data_map.get(f, 0.0) for f in features]
+        features = self.metadata.get(compound_key, {}).get("features", [])
 
-        X = np.array([row], dtype=np.float32)
-        # Il degrado non può essere negativo (la gomma non rigenera tempo)
-        return max(0.0, float(self.models[compound].predict(X)[0]))
+        try:
+            row = [data.get(f, 0.0) for f in features]
+            X = np.array([row], dtype=np.float32)
+            step_pred = float(self.models[compound_key].predict(X)[0])
+            offset = self.metadata.get(compound_key, {}).get("offset_g1", 0.0)
+            return max(0.0, step_pred - offset)
 
-    def assess_stint_risk(self, compound: str, stint_length: int, track_temp: float = 38.0, **kwargs) -> dict:
+        except Exception as e:
+            logger.exception(f"Errore predizione step {compound_key}: {e}")
+            return 0.0
+
+    def assess_stint_risk(self, compound: str, stint_length: int, **kwargs) -> dict:
         """
-        Valuta il rischio degrado di uno stint completo.
+        Valuta il rischio basandosi sull'accumulo degli step predetti.
         """
-        cliff = self.get_cliff(compound)
+        cliff_lap = self.get_cliff(compound)
 
-        # Somma del degrado giro per giro
-        total_deg = sum(
-            self.predict_delta(compound, lap, track_temp=track_temp, **kwargs) for lap in range(1, stint_length + 1)
-        )
+        # Estraiamo i parametri necessari per predict_step, con fallback
+        # 'weather' è ora obbligatorio in predict_step, quindi diamogli un default qui
+        weather = kwargs.get("weather", "dry")
 
-        exceeds = stint_length > cliff
-        penalty = 0.0
+        accumulated_degr = 0.0
+        degr_history = []
 
+        for lap in range(1, stint_length + 1):
+            # Passiamo esplicitamente weather e il resto tramite kwargs
+            step = self.predict_step(compound, lap, weather=weather, **kwargs)
+            accumulated_degr += step
+            degr_history.append(accumulated_degr)
+
+        final_degr = accumulated_degr
+        exceeds = stint_length > cliff_lap
+
+        penalty_avg = 0.0
         if exceeds:
-            # Calcolo della penalità: media del degrado nei giri oltre il cliff
-            extra_laps = stint_length - cliff
-            penalty = sum(
-                self.predict_delta(compound, cliff + l, track_temp=track_temp, **kwargs) for l in range(1, extra_laps + 1)
-            ) / max(extra_laps, 1)
+            # Calcolo corretto della media sui giri oltre il cliff
+            # degr_history è 0-indexed, quindi il giro cliff_lap è all'indice cliff_lap-1
+            beyond_cliff = degr_history[cliff_lap:]
+            if beyond_cliff:
+                penalty_avg = sum(beyond_cliff) / len(beyond_cliff)
 
         return {
             "compound": compound,
             "stint_length": stint_length,
-            "cliff_lap": cliff,
-            "total_degradation_seconds": round(total_deg, 2),
+            "cliff_lap": cliff_lap,
+            "total_degradation_seconds": round(final_degr, 2),
             "exceeds_cliff": exceeds,
-            "penalty_seconds": round(penalty, 2),
-            "risk_level": "HIGH" if exceeds and penalty > 4 else ("MEDIUM" if exceeds else "LOW"),
+            "penalty_seconds": round(penalty_avg, 2),
+            "risk_level": "HIGH"
+            if final_degr > 2.5 or (exceeds and penalty_avg > 1.5)
+            else ("MEDIUM" if exceeds else "LOW"),
         }
 
 
@@ -318,8 +334,6 @@ class SafetyCarImpactModel:
 
 
 # ── StrategyEvaluator ─────────────────────────────────────────────────────────
-
-
 class StrategyEvaluator:
     """
     Valuta una strategia giro per giro usando LapTimePredictor.
@@ -369,26 +383,30 @@ class StrategyEvaluator:
         total_time = 0.0
         lap_results = []
         pit_stops = 0
-        current_prev_lap_time = 92.0  # Valore di fallback per il giro 1
+        current_prev_lap_time = 92.0
         sc_current_step = 0
+        accumulated_usura = 0.0
+        current_stint_start = -1
 
         for lap in range(1, total_laps + 1):
             stint = lap_to_stint.get(lap)
             if not stint:
                 continue
 
+            # --- RESET USURA SE CAMBIAMO STINT (PIT STOP) ---
+            if stint["start_lap"] != current_stint_start:
+                accumulated_usura = 0.0
+                current_stint_start = stint["start_lap"]
+
             compound = stint["compound"]
-            stint_lap = lap - stint["start_lap"]
+            stint_lap = lap - stint["start_lap"] + 1  # Giro 1 della gomma
             weather = ("heavy_rain" if rain_intens == "heavy" else "light_rain") if lap >= rain_start else "dry"
 
-            # Gestione Safety Car
+            # Gestione Safety Car (rimane invariata)
             is_sc = sc_active and sc_lap_trigger <= lap < sc_lap_trigger + sc_duration
-            if is_sc:
-                sc_current_step += 1
-            else:
-                sc_current_step = 0
+            sc_current_step = sc_current_step + 1 if is_sc else 0
 
-            # 1. Calcolo del PIT COST (se è un giro di sosta)
+            # 1. Calcolo del PIT COST
             is_pit = lap == stint["start_lap"] and lap > 1
             pit_cost = 0.0
             if is_pit:
@@ -409,9 +427,9 @@ class StrategyEvaluator:
 
             # 2. Predizione LAP TIME
             if is_sc:
-                # Sotto SC il tempo è dettato dalla direzione gara (es. 140% del tempo normale)
                 lap_time = current_prev_lap_time / sc_speed_ratio if sc_speed_ratio > 0 else 140.0
             else:
+                # A. LAPTIME BASE (Il potenziale della vettura in questo giro)
                 lap_time = self.lap_model.predict(
                     compound=compound,
                     stint_lap=stint_lap,
@@ -424,17 +442,42 @@ class StrategyEvaluator:
                     humidity=conditions.get("weather", {}).get("humidity", 50.0),
                 )
 
-            # Aggiornamento stato per il giro successivo
+                # B. MODELLO INCREMENTALE DEGRADO
+                # Chiediamo al modello GBR: "quanto è invecchiata la gomma in questo giro?"
+                step_degr = self.deg_model.predict_step(
+                    compound=compound,
+                    stint_lap=stint_lap,
+                    weather=weather,
+                    track_temp=track_temp,
+                    air_temp=air_temp,
+                    lap_number=lap,
+                    max_session_laps=total_laps,
+                    prev_lap_duration=current_prev_lap_time,
+                    humidity=conditions.get("weather", {}).get("humidity", 50.0),
+                )
+
+                # Accumuliamo il danno (monotonicità garantita)
+                accumulated_usura += max(0.0, step_degr)
+                # logger.info(f" Lap {lap} ({compound}): Usura accumulata +{accumulated_usura:.3f}s")
+
+                # Applichiamo l'usura accumulata al tempo base
+                lap_time += accumulated_usura
+
+                if stint_lap % 5 == 0:  # Logga ogni 5 giri per non intasare
+                    logger.info(f" Lap {lap} ({compound}): Usura accumulata +{accumulated_usura:.3f}s")
+
+                # C. Penalità meteo (Guardrail rimangono invariati)
+                is_slick = compound.lower() in {"soft", "medium", "hard"}
+                if weather == "light_rain" and is_slick:
+                    lap_time += 7.0
+                elif weather == "heavy_rain" and is_slick:
+                    lap_time += 20.0
+                elif weather == "dry" and compound.lower() in {"intermediate", "wet"}:
+                    lap_time += 5.0
+
+            # Aggiornamento stato
             current_prev_lap_time = lap_time
             total_time += lap_time
-
-            is_slick = compound.lower() in {"soft", "medium", "hard"}
-            if weather == "light_rain" and is_slick:
-                lap_time += 7.0  # Penalità fissa per pioggia leggera
-            elif weather == "heavy_rain" and is_slick:
-                lap_time += 20.0  # Penalità pesante (quasi impraticabile)
-            elif weather == "dry" and compound.lower() in {"intermediate", "wet"}:
-                lap_time += 5.0  # Le gomme da pioggia si surriscaldano su asciutto
 
             lap_results.append(
                 {
@@ -447,6 +490,7 @@ class StrategyEvaluator:
                     "is_sc_lap": is_sc,
                     "pit_cost": round(pit_cost, 2) if is_pit else 0.0,
                     "cumulative_time": round(total_time, 3),
+                    "tire_degradation": round(accumulated_usura, 3),
                 }
             )
 
@@ -480,17 +524,9 @@ class StrategyEvaluator:
 
 
 # ── StrategyValidator ─────────────────────────────────────────────────────────
-
-
 class StrategyValidator:
     """
     Valida e assegna un punteggio a una strategy.json esterna.
-
-    Il punteggio composito (0–100) si compone di:
-      - 50% tempo totale ML
-      - 25% rischio degrado
-      - 15% sincronizzazione SC
-      - 10% correttezza formato
 
     PRIMA del calcolo ML vengono applicati i constraint fisici F1:
     violazioni gravi (slick su pioggia pesante, wet su asciutto, ecc.)
@@ -500,8 +536,8 @@ class StrategyValidator:
 
     W_TIME = 0.50
     W_DEGR = 0.25
-    W_SC = 0.15
-    W_FORMAT = 0.10
+    W_SC = 0.20
+    W_FORMAT = 0.05
 
     # Compound considerati "slick" (non adatti alla pioggia)
     SLICK_COMPOUNDS = {"soft", "medium", "hard"}
@@ -512,7 +548,6 @@ class StrategyValidator:
         self.evaluator = evaluator
 
     # ── Constraint fisici ──────────────────────────────────────────────────────
-
     def _check_weather_constraints(self, strategy: list, conditions: dict) -> tuple[list[str], list[str], float]:
         """
         Verifica che i compound siano compatibili con le condizioni meteo

@@ -23,11 +23,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import cross_val_score
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.preprocessing import StandardScaler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("trainer")
@@ -135,7 +134,6 @@ def _temporal_split(
 
 
 # ── Modello 1: LapTimePredictor ────────────────────────────────────────────────
-
 LAP_FEATURES = [
     "compound_enc",
     "stint_lap",
@@ -234,90 +232,120 @@ def train_lap_time_model(df: pd.DataFrame, test_circuit: str | None = None) -> d
 
 DEGR_FEATURES = [
     "stint_lap",
-    "track_temp",
-    "air_temp",
-    "speed_mean",
+    "stint_lap_sq",
     "lap_number",
     "session_progression",
+    "compound_enc",
     "weather_enc",
+    "track_temp",
+    "air_temp",
+    "humidity",
+    "wind_speed",
     "avg_energy_session",
+    "speed_mean",
+    "speed_range",
+    "speed_efficiency",
+    "prev_lap_duration",
+    "duration_sector_1_norm",
+    "duration_sector_2_norm",
+    "duration_sector_3_norm",
 ]
 
 
 def train_degradation_model(df: pd.DataFrame, test_circuit: str | None = None) -> dict:
-    logger.info("\n=== Training DegradationRiskModel (Ridge polynomial per compound) ===")
+    logger.info("\n=== Training DegradationRiskModel (Incremental Step GBR) ===")
 
     train_df, test_df = _temporal_split(df, test_circuit)
     results = {}
     models = {}
 
     for compound in COMPOUND_ENC:
-        sub_train = train_df[train_df["compound"] == compound]
-        sub_test = test_df[test_df["compound"] == compound]
-
+        # 1. Preparazione Training Set
+        sub_train = train_df[train_df["compound"] == compound].copy()
         if len(sub_train) < 50:
-            logger.warning(f"  {compound}: dati insufficienti ({len(sub_train)}), skip")
             continue
 
-        avail_features = [f for f in DEGR_FEATURES if f in sub_train.columns and sub_train[f].isna().mean() < 0.3]
+        # ORDINE CRUCIALE: Ordiniamo per sessione, pilota e giro per calcolare il delta
+        sub_train = sub_train.sort_values(["session_key", "driver_number", "lap_number"])
 
+        # --- LOGICA INCREMENTALE ---
+        # Calcoliamo la differenza di tempo tra questo giro e il precedente (nello stesso stint)
+        # Se lo stint_lap è 1, il delta è 0 (punto di partenza)
+        sub_train["degr_step"] = sub_train.groupby(["session_key", "driver_number"])["lap_duration_norm"].diff().fillna(0)
+        sub_train.loc[sub_train["stint_lap"] == 1, "degr_step"] = 0
+
+        # Pulizia: un incremento sensato sta tra -0.1 (track evolution) e 0.6 (usura pesante)
+        # Escludiamo errori, traffico o pit stop che sporcano il delta istantaneo
+        sub_train = sub_train[sub_train["degr_step"].between(-0.2, 0.8)]
+
+        # 2. Selezione feature
+        avail_features = [f for f in DEGR_FEATURES if f in sub_train.columns]
         X_train = sub_train[avail_features].values.astype(np.float32)
-        y_train = sub_train["lap_duration_norm"].values.astype(np.float32)
-        X_test = sub_test[avail_features].values.astype(np.float32) if len(sub_test) > 0 else None
-        y_test = sub_test["lap_duration_norm"].values.astype(np.float32) if len(sub_test) > 0 else None
+        y_train = sub_train["degr_step"].values.astype(np.float32)
 
-        pipe = Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("poly", PolynomialFeatures(degree=2, include_bias=False)),
-                ("ridge", Ridge(alpha=10.0)),
-            ]
-        )
-        pipe.fit(X_train, y_train)
+        # 3. Preparazione Test Set
+        sub_test = test_df[test_df["compound"] == compound].copy()
+        X_test, y_test = None, None
+        if len(sub_test) >= 10:
+            sub_test = sub_test.sort_values(["session_key", "driver_number", "lap_number"])
+            sub_test["degr_step"] = sub_test.groupby(["session_key", "driver_number"])["lap_duration_norm"].diff().fillna(0)
+            sub_test.loc[sub_test["stint_lap"] == 1, "degr_step"] = 0
 
-        test_mae = None
-        if X_test is not None and len(X_test) > 0:
-            y_pred = pipe.predict(X_test)
-            test_mae = round(float(mean_absolute_error(y_test, y_pred)), 4)
+            X_test = sub_test[avail_features].values.astype(np.float32)
+            y_test = sub_test["degr_step"].values.astype(np.float32)
 
-        # --- Calcolo dinamico del Cliff ---
-        # Usiamo i valori mediani del compound per simulare uno stint standard
-        meds = {f: float(sub_train[f].median()) for f in avail_features if f != "stint_lap"}
-        if "weather_enc" in meds:
-            meds["weather_enc"] = 0.0  # Simuliamo su asciutto
+        # 4. Training GBR
+        # Usiamo Huber loss per essere robusti ai giri con traffico
+        model = GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, max_depth=5, loss="huber", random_state=42)
+        model.fit(X_train, y_train)
 
-        cliff_lap = 54
-        for lap in range(1, 55):
+        # 5. Validazione
+        test_mae = "N/A"
+        if X_test is not None:
+            test_mae = round(float(mean_absolute_error(y_test, model.predict(X_test))), 4)
+
+        # 6. Simulazione Cliff (per metadati)
+        # Simuliamo lo stint accumulando i 'step' predetti
+        meds = {f: float(sub_train[f].median()) for f in avail_features}
+        meds["session_progression"] = 0.5
+        meds["lap_number"] = 27
+
+        def get_step_pred(lap):
             row = []
             for f in avail_features:
                 if f == "stint_lap":
-                    row.append(lap)
+                    row.append(float(lap))
+                elif f == "stint_lap_sq":
+                    row.append(float(lap**2))
                 else:
                     row.append(meds.get(f, 0.0))
+            return float(model.predict(np.array([row], dtype=np.float32))[0])
 
-            delta = float(pipe.predict(np.array([row], dtype=np.float32))[0])
-            if delta > 2.0:  # Soglia critica: perdita di 2 secondi rispetto al best
+        accumulated_degr = 0.0
+        cliff_lap = 54
+        for lap in range(1, 61):
+            step = get_step_pred(lap)
+            # Solo incrementi positivi per la simulazione del cliff
+            accumulated_degr += max(0.0, step)
+            if accumulated_degr > 1.5:
                 cliff_lap = lap
                 break
 
-        models[compound] = pipe
+        models[compound] = model
         results[compound] = {
             "features": avail_features,
             "cliff_lap": cliff_lap,
-            "n_train": len(sub_train),
-            "n_test": len(sub_test),
             "test_mae": test_mae,
-            "avg_energy": round(meds.get("avg_energy_session", 0), 2),
+            "n_train": len(sub_train),
         }
-        mae_str = f"test_MAE={test_mae:.4f}s" if test_mae else "test_MAE=N/A"
-        logger.info(f"  {compound:<14} cliff≈{cliff_lap}giri | n_train={len(sub_train)} | {mae_str}")
+        logger.info(f"  {compound:<12} | Cliff: {cliff_lap:>2} | Step MAE: {test_mae} | Feat: {len(avail_features)}")
 
+    # Salvataggio
     path = MODEL_DIR / "degradation_model.pkl"
     with open(path, "wb") as f:
         pickle.dump({"models": models, "metadata": results}, f)
-    logger.info(f"  Salvato: {path}")
 
-    return {"type": "Ridge(poly=2) per compound", "compounds": results}
+    return {"type": "GBR Incremental Step", "compounds": results}
 
 
 # ── Modello 3: SafetyCarImpactModel ───────────────────────────────────────────
@@ -499,8 +527,6 @@ def save_training_report(reports: dict, df: pd.DataFrame):
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
-
-
 def run(csv_path: Path | None = None, test_circuit: str | None = None):
     if csv_path is None:
         csv_path = DATA_DIR / "all_circuits_laps.csv"
