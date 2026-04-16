@@ -29,28 +29,6 @@ Il sistema è progettato per la competizione **Scuderia Algoritmo** e supporta:
 
 ---
 
-## 🗂️ Architettura
-
-```
-f1_strategy/
-├── main.py                      ← Entry point pipeline end-to-end
-├── race_conditions.json         ← Condizioni gara input
-├── openf1_client.py             ← Wrapper API OpenF1 (caching, retry, paginazione)
-├── agents/
-│   ├── data_analysis_agent.py   ← Agent 1: Analisi dati storici
-│   ├── race_simulator.py        ← Agent 2: Simulatore scenari strategici
-│   ├── strategy_agent.py        ← Agent 3: Produzione strategia finale
-│   └── report_generator.py      ← Agent 4: Output grafici e report
-├── cache/                       ← Cache locale dati API (TTL 24h)
-└── outputs/
-    ├── strategy.json            ← OUTPUT PRINCIPALE (formato competizione)
-    ├── report.txt               ← Report testuale
-    ├── strategy_chart.html      ← Grafici interattivi (Chart.js)
-    └── full_analysis.json       ← Dati completi analisi
-```
-
----
-
 ## ⚙️ Installazione
 
 ### Prerequisiti
@@ -78,13 +56,9 @@ poetry shell
 
 ```bash
 # Pipeline completa (legge race_conditions.json)
-python main.py
+poetry run python src/f1_strategy/train_models.py --data data/all_circuits_laps.csv
 
-# Con file condizioni personalizzato
-python main.py --conditions /path/to/race_conditions.json
-
-# Senza chiamate API (usa knowledge base locale)
-python main.py --no-api
+poetry run python src/f1_strategy/main.py --strategies-dir inputs/teams/
 ```
 
 ### Configurare le condizioni di gara
