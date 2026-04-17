@@ -2,14 +2,14 @@
   "circuit": "Monza", 
   "total_laps": 53, 
   "weather": { 
-    "rain_start_lap": 999, 
-    "rain_intensity": "none" 
+    "rain_start_lap": 38, 
+    "rain_intensity": "light" 
   }, 
   "safety_car": { 
     "active": true, 
     "lap": 16, 
-    "duration_laps": 4
+    "duration_laps": 5
   },
    "pit_lane_avg_time_loss_seconds": 22.5, 
-   "pit_lane_std_time_loss_seconds ": 0.4
+   "pit_lane_std_time_loss_seconds ": 1.5
 }

@@ -1,8 +1,8 @@
 {
-  "team_name": "Track-Position-Pro",
+  "team_name": "Strategy5",
   "strategy": [
     { "stint": 1, "compound": "soft", "start_lap": 1 },
-    { "stint": 2, "compound": "medium", "start_lap": 15 }
+    { "stint": 2, "compound": "medium", "start_lap": 16 }
   ],
   "rationale": "Sfrutta l'extra grip iniziale della Soft per superare nel traffico. La Medium viene montata presto per fare un 'undercut' massiccio su tutto il midfield."
 }

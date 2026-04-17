@@ -1,5 +1,5 @@
 {
-  "team_name": "Standard-Master",
+  "team_name": "Strategy2",
   "strategy": [
     { "stint": 1, "compound": "soft", "start_lap": 1 },
     { "stint": 2, "compound": "hard", "start_lap": 16 }

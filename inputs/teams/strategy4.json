@@ -1,8 +1,8 @@
 {
-  "team_name": "Weather-Gambit",
+  "team_name": "Strategy4",
   "strategy": [
-    { "stint": 1, "compound": "medium", "start_lap": 1 },
-    { "stint": 2, "compound": "wet", "start_lap": 25 }
+    { "stint": 1, "compound": "hard", "start_lap": 1 },
+    { "stint": 2, "compound": "wet", "start_lap": 38 }
   ],
   "rationale": "Strategia basata su previsione pioggia. Allunghiamo il primo stint su Medium sacrificando un po' di degrado per evitare un pit stop extra prima dell'arrivo dell'acqua."
 }
